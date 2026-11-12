@@ -8,16 +8,25 @@ import logging
 import re
 import unicodedata
 import zipfile
+import zlib
 from datetime import date, datetime
 from functools import partial
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 
 import database as db
 import security
-from ai_service import SEM_ATRASO, SEM_PARTICULARIDADES, gerar_analise_offline, processar_registro_obra
+from ai_service import (
+    SEM_ATRASO,
+    SEM_PARTICULARIDADES,
+    TRANSCRICAO_INDISPONIVEL,
+    gerar_analise_offline,
+    processar_registro_obra,
+    transcrever_audio_garantido,
+)
 from security import LIMITE_TEXTO_LONGO, MidiaInvalidaError, sanitize_text
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -142,10 +151,39 @@ footer {visibility: hidden;}
 [data-testid="stCheckbox"] label > span:first-child {transform: scale(1.3); margin-right: .7rem;}
 .stTabs [data-baseweb="tab"] {min-height: 3rem; padding: 0 .9rem;}
 [data-testid="stSegmentedControl"] button {min-height: 2.75rem;}
+/* Iframe invisível que aplica o bloqueio de tradução (não ocupa espaço). */
+.stElementContainer:has(> iframe[height="0"]), [data-testid="stElementContainer"]:has(iframe[height="0"]) {display: none;}
+.ot-transcricao {border-left: 4px solid #3b82f6; background: rgba(59, 130, 246, .08); border-radius: 8px;
+  padding: .55rem .8rem; margin: .3rem 0 .6rem; font-size: .95rem; line-height: 1.45;}
 </style>
 """,
     unsafe_allow_html=True,
 )
+
+
+# O tradutor automático do Chrome reescreve os textos da página ("anéis" → "animais") e
+# troca nós do DOM que o React do Streamlit controla, o que derruba a tela com
+# "NotFoundError: Failed to execute 'removeChild' on 'Node'". O script abaixo roda num
+# iframe invisível (mesma origem) e marca a página inteira como pt-BR e "não traduzir".
+_BLOQUEIO_TRADUCAO = """<script>
+(function () {
+  try {
+    var d = window.parent.document, alvos = [d.documentElement, d.body];
+    alvos.forEach(function (el) {
+      if (!el) return;
+      el.setAttribute("translate", "no");
+      el.classList.add("notranslate");
+    });
+    d.documentElement.setAttribute("lang", "pt-BR");
+    if (!d.querySelector('meta[name="google"][content="notranslate"]')) {
+      var m = d.createElement("meta");
+      m.name = "google"; m.content = "notranslate";
+      d.head.appendChild(m);
+    }
+  } catch (e) {}
+})();
+</script>"""
+components.html(_BLOQUEIO_TRADUCAO, height=0)
 
 
 # --------------------------------------------------------------------------- #
@@ -211,6 +249,11 @@ def slug(texto: str, sep: str = "-", padrao: str = "Geral") -> str:
         c for c in unicodedata.normalize("NFKD", texto or "") if not unicodedata.combining(c)
     )
     return re.sub(r"[^A-Za-z0-9]+", sep, sem_acento).strip(sep)[:40].strip(sep) or padrao
+
+
+def chave_ambiente(ambiente: str) -> str:
+    """Sufixo estável e único para keys de widgets por ambiente ('Área Externa' ≠ 'Area Externa')."""
+    return f"{slug(ambiente, '_')}_{zlib.crc32((ambiente or '').encode('utf-8')):08x}"
 
 
 def icone_ambiente(ambiente: str) -> str:
@@ -334,6 +377,8 @@ def vincular_fotos_do_registro(
     sem tarefas, o cômodo citado no relato ou no escopo da obra.
     """
     classificadas = {f.indice_foto: f for f in analise.fotos_classificadas}
+    if db.SEM_FOTO_ASBUILT.lower() in (dados.get("mapeamento_asbuilt") or "").lower():
+        dados = {**dados, "mapeamento_asbuilt": ""}
     principal = next((t for t in tarefas_novas if t["concluida"]), tarefas_novas[0] if tarefas_novas else None)
     relato = f"{analise.transcricao_audio} {obs}"
     ids = []
@@ -371,7 +416,7 @@ def grade_fotos(fotos: list[tuple[dict, Path]], prefixo: str, colunas: int = 3, 
             st.image(str(foto), width="stretch")
             if legenda_tecnica:
                 st.markdown(f"**{m.get('titulo_servico') or 'Registro fotográfico'}**")
-                st.caption(f"📐 {m.get('descricao_tecnica') or 'Sem descrição técnica.'}")
+                st.caption(f"📐 {asbuilt_exibivel(m.get('descricao_tecnica'), True)}")
             else:
                 st.caption(info_tamanho(m, foto))
             with st.container(horizontal=True, gap="small"):
@@ -692,10 +737,38 @@ def tocar_audio(caminho: Path) -> None:
     st.audio(str(caminho), format=FORMATO_AUDIO.get(caminho.suffix.lower(), "audio/wav"))
 
 
+def transcricao_real(texto: str | None) -> str:
+    """A transcrição gravada, ou "" se o registro só tem o aviso de transcrição indisponível."""
+    texto = (texto or "").strip()
+    return "" if not texto or texto == TRANSCRICAO_INDISPONIVEL else texto
+
+
+def bloco_transcricao(texto: str | None, tem_audio: bool, registro_id: int | None = None,
+                      caminho_audio: str | None = None, chave: str = "") -> None:
+    """Mostra, aberto e logo abaixo do player, o que foi falado no áudio."""
+    if falado := transcricao_real(texto):
+        st.markdown(f"<div class='ot-transcricao'>🎙️ <strong>O que foi falado no áudio:</strong> "
+                    f"“{esc(falado)}”</div>", unsafe_allow_html=True)
+    elif tem_audio:
+        st.caption("🎙️ A transcrição deste áudio ainda não está disponível.")
+        if registro_id is not None and caminho_audio:
+            st.button("🔄 Transcrever o áudio agora", key=f"retranscrever_{chave}_{registro_id}",
+                      on_click=_retranscrever_cb, args=(registro_id, caminho_audio),
+                      help="Converte a fala do áudio gravado em texto e grava no registro.")
+
+
+def asbuilt_exibivel(texto: str | None, tem_foto: bool) -> str:
+    """Nunca mostra "Sem foto para mapeamento As-Built" quando há foto anexada."""
+    texto = (texto or "").strip()
+    if tem_foto and (not texto or db.SEM_FOTO_ASBUILT.lower() in texto.lower()):
+        return "Descrição técnica ainda não preenchida. Use ✏️ na foto (Galeria) para completar."
+    return texto
+
+
 def card_registro(r: dict, tarefas: list[dict] | None = None, com_acoes: bool = False,
-                  midias: list[dict] | None = None) -> None:
-    """Card de um registro: data, badge, áudio, atraso, resumo, tarefas, fotos + As-Built, transcrição."""
-    with st.container(border=True):
+                  midias: list[dict] | None = None, contexto: str = "hist") -> None:
+    """Card de um registro: data, áudio + transcrição, atraso, resumo, tarefas e fotos com As-Built."""
+    with st.container(border=True, key=f"card_reg_{contexto}_{r['id']}"):
         st.markdown(f"<span class='ot-data'>📅 {esc(formatar_data(r['data_registro']))}</span>",
                     unsafe_allow_html=True)
 
@@ -703,6 +776,8 @@ def card_registro(r: dict, tarefas: list[dict] | None = None, com_acoes: bool = 
         if audio:
             st.caption("🎙️ Relato original do canteiro")
             tocar_audio(audio)
+        bloco_transcricao(r.get("transcricao_audio"), audio is not None, r["id"] if com_acoes else None,
+                          r.get("caminho_audio"), chave=contexto)
 
         if tem_atraso(r.get("motivo_atraso")):
             st.warning(f"**Justificativa de atraso:** {r['motivo_atraso']}", icon="⚠️")
@@ -717,28 +792,36 @@ def card_registro(r: dict, tarefas: list[dict] | None = None, com_acoes: bool = 
             st.markdown("**🧱 Tarefas identificadas:**")
             lista_tarefas_simples(tarefas)
 
-        if r.get("mapeamento_asbuilt"):
-            st.markdown(f"**📐 Mapeamento As-Built:** {r['mapeamento_asbuilt']}")
         fotos = midias_com_arquivo(midias or [])
-        if fotos:
-            st.markdown(f"**📷 {len(fotos)} foto(s) do dia:** "
+        if not fotos and (legado := resolver_caminho(r.get("caminho_foto"))):
+            # Registro antigo cuja foto ainda não passou pela migração para a galeria.
+            fotos = [({"id": f"leg{r['id']}", "ambiente": "Geral", "titulo_servico": "", "descricao_tecnica": "",
+                       "foto_bytes_original": r.get("foto_bytes_original")}, legado)]
+        asbuilt = asbuilt_exibivel(r.get("mapeamento_asbuilt"), bool(fotos))
+        if not fotos:
+            if asbuilt:
+                st.markdown(f"**📐 Mapeamento As-Built:** {asbuilt}")
+        else:
+            st.markdown(f"**📷 Fotos do dia ({len(fotos)}):** "
                         + "".join(badge_ambiente(a) for a in dict.fromkeys(m["ambiente"] for m, _ in fotos)),
                         unsafe_allow_html=True)
-            colunas = st.columns(min(len(fotos), 3))
-            for i, (m, foto) in enumerate(fotos):
-                colunas[i % len(colunas)].image(str(foto), width="stretch",
-                                                caption=sanitize_text(m.get("titulo_servico"), LIM_TAREFA) or None)
-
-        if r.get("transcricao_audio"):
-            with st.expander("📝 Transcrição do áudio"):
-                st.write(r["transcricao_audio"])
+            for m, foto in fotos:
+                with st.container(key=f"foto_reg_{contexto}_{r['id']}_{m['id']}"):
+                    c_img, c_txt = st.columns([1, 1], vertical_alignment="top")
+                    c_img.image(str(foto), width=350)
+                    with c_txt:
+                        if m.get("titulo_servico"):
+                            st.markdown(f"**{m['titulo_servico']}**")
+                        descricao = asbuilt_exibivel(m.get("descricao_tecnica") or r.get("mapeamento_asbuilt"), True)
+                        st.markdown(f"**📐 Mapeamento As-Built:** {descricao}")
+                        st.caption(info_tamanho(m, foto))
 
         if com_acoes:
             with st.container(horizontal=True):
                 if st.button("✏️ Editar Registro", key=f"edit_reg_{r['id']}", help="Corrigir transcrição, resumo, detalhes de execução, atrasos ou As-Built."):
                     dialog_editar_registro(r)
                 if st.button("🗑️ Excluir Registro", key=f"del_reg_{r['id']}", help="Remove o registro e o áudio (pede confirmação)."):
-                    dialog_excluir_registro(r, len(tarefas or []), len(fotos))
+                    dialog_excluir_registro(r, len(tarefas or []), len([m for m, _ in fotos if isinstance(m["id"], int)]))
 
 
 def card_obra(o: dict, resumo: dict, selecionada: bool, chave: str) -> None:
@@ -759,7 +842,7 @@ def card_obra(o: dict, resumo: dict, selecionada: bool, chave: str) -> None:
                   on_click=selecionar_obra, args=(o["id"],))
 
 
-def seletor_ambiente(rotulo: str, opcoes: list[str], atual: str | None = None, **kwargs) -> str | None:
+def seletor_ambiente(rotulo: str, opcoes: list[str], atual: str | None = None, *, key: str, **kwargs) -> str | None:
     """Selectbox com os ambientes recomendados e opção de digitar um novo."""
     if atual and atual not in opcoes:
         opcoes = [atual, *opcoes]
@@ -768,7 +851,7 @@ def seletor_ambiente(rotulo: str, opcoes: list[str], atual: str | None = None, *
         placeholder="Escolha ou + digite novo ambiente...", accept_new_options=True,
         help="Sugestões aprendidas com as tarefas desta e das outras obras. Para um cômodo novo, "
         "digite o nome e confirme.",
-        **kwargs,
+        key=key, **kwargs,
     )
 
 
@@ -779,27 +862,29 @@ def seletor_ambiente(rotulo: str, opcoes: list[str], atual: str | None = None, *
 def dialog_editar_registro(r: dict) -> None:
     with st.form(f"form_dialog_reg_{r['id']}", enter_to_submit=False, border=False):
         data_reg = st.date_input(
-            "Data do registro", value=para_data(r["data_registro"]), format="DD/MM/YYYY",
+            "Data do registro", value=para_data(r["data_registro"]), format="DD/MM/YYYY", key=f"reg_data_{r['id']}",
             help="Dia a que o relato se refere.",
         )
-        transcricao = st.text_area("Transcrição do áudio", value=r.get("transcricao_audio") or "", height=140,
+        transcricao = st.text_area("Transcrição do áudio", value=r.get("transcricao_audio") or "", height=140, key=f"reg_transc_{r['id']}",
                                    max_chars=LIMITE_TEXTO_LONGO,
                                    help="Texto do relato falado. Corrija palavras que tenham sido mal entendidas.")
         resumo = st.text_area("Resumo executivo", value=r.get("resumo_executivo") or "", max_chars=LIMITE_TEXTO_LONGO,
+                              key=f"reg_resumo_{r['id']}",
                               help="Serviços do dia como serão apresentados ao cliente.")
         detalhes = st.text_area(
             "Detalhes de execução / imprevistos", value=r.get("detalhes_execucao_imprevistos") or "",
+            key=f"reg_detalhes_{r['id']}",
             max_chars=LIMITE_TEXTO_LONGO,
             help="Particularidades técnicas do serviço, dificuldades do terreno/estrutura, clima ou "
             "justificativas de prazo.",
         )
-        motivo = st.text_area("Justificativa de atraso", value=r.get("motivo_atraso") or SEM_ATRASO,
+        motivo = st.text_area("Justificativa de atraso", value=r.get("motivo_atraso") or SEM_ATRASO, key=f"reg_atraso_{r['id']}",
                               max_chars=LIMITE_TEXTO_LONGO,
                               help=f"Chuva, faltas, material ou problemas técnicos. Sem atraso: '{SEM_ATRASO}'.")
-        asbuilt = st.text_area("Mapeamento As-Built", value=r.get("mapeamento_asbuilt") or "",
+        asbuilt = st.text_area("Mapeamento As-Built", value=r.get("mapeamento_asbuilt") or "", key=f"reg_asbuilt_{r['id']}",
                                max_chars=LIMITE_TEXTO_LONGO,
                                help="Posição de canos, conduítes e fiação para manutenções futuras.")
-        if st.form_submit_button("💾 Salvar alterações", type="primary", width="stretch"):
+        if st.form_submit_button("💾 Salvar alterações", type="primary", width="stretch", key=f"reg_salvar_{r['id']}"):
             longo = partial(sanitize_text, max_length=LIMITE_TEXTO_LONGO)
             db.atualizar_registro_diario(
                 r["id"], data_reg.isoformat(), longo(transcricao), longo(resumo),
@@ -820,15 +905,17 @@ def dialog_excluir_registro(r: dict, qtd_tarefas: int, qtd_fotos: int = 0) -> No
     if qtd_tarefas:
         apagar_tarefas = st.checkbox(
             f"Excluir também as {qtd_tarefas} tarefa(s) do checklist extraídas deste registro",
+            key=f"del_reg_tarefas_{r['id']}",
             help="Desmarcado: as tarefas continuam no checklist da obra.",
         )
     if qtd_fotos:
         apagar_fotos = st.checkbox(
             f"Excluir também as {qtd_fotos} foto(s) deste registro",
+            key=f"del_reg_fotos_{r['id']}",
             help="Desmarcado: as fotos continuam na Galeria da Obra, no ambiente delas.",
         )
     c1, c2 = st.columns(2)
-    if c1.button("Cancelar", width="stretch"):
+    if c1.button("Cancelar", width="stretch", key=f"cancel_del_reg_{r['id']}"):
         st.rerun()
     # A exclusão roda no on_click (antes de qualquer rerun, do dialog ou da página inteira).
     if c2.button("Excluir definitivamente", type="primary", width="stretch", key=f"ok_del_reg_{r['id']}",
@@ -843,9 +930,9 @@ def dialog_excluir_obra(obra: dict, qtd_registros: int, qtd_tarefas: int) -> Non
         f"{qtd_tarefas} tarefa(s) e todos os áudios e fotos desta obra. Esta ação não pode ser desfeita.",
         icon="⚠️",
     )
-    confirmado = st.checkbox("Entendo que os dados desta obra serão perdidos")
+    confirmado = st.checkbox("Entendo que os dados desta obra serão perdidos", key=f"conf_del_obra_{obra['id']}")
     c1, c2 = st.columns(2)
-    if c1.button("Cancelar", width="stretch"):
+    if c1.button("Cancelar", width="stretch", key=f"cancel_del_obra_{obra['id']}"):
         st.rerun()
     if c2.button("Excluir bloco", type="primary", width="stretch", disabled=not confirmado,
                  key=f"ok_del_obra_{obra['id']}", on_click=_excluir_obra_cb, args=(obra["id"], obra["nome_cliente"])):
@@ -875,13 +962,15 @@ def dialog_foto(m: dict, foto: Path) -> None:
 @st.dialog("✏️ Editar Foto")
 def dialog_editar_midia(m: dict) -> None:
     with st.form(f"form_edit_midia_{m['id']}", enter_to_submit=False, border=False):
-        amb = seletor_ambiente("Ambiente", db.listar_ambientes_recomendados(m["obra_id"]), atual=m["ambiente"])
+        amb = seletor_ambiente("Ambiente", db.listar_ambientes_recomendados(m["obra_id"]), atual=m["ambiente"],
+                               key=f"midia_amb_{m['id']}")
         titulo = st.text_input("Serviço realizado", value=m.get("titulo_servico") or "", max_chars=LIM_TAREFA,
+                               key=f"midia_titulo_{m['id']}",
                                help="Ex.: Retirada da cerâmica do banheiro.")
-        descricao = st.text_area("Descrição técnica", value=m.get("descricao_tecnica") or "",
+        descricao = st.text_area("Descrição técnica", value=m.get("descricao_tecnica") or "", key=f"midia_desc_{m['id']}",
                                  max_chars=LIMITE_TEXTO_LONGO,
                                  help="Posição de canos, conduítes e fiação, medidas de referência.")
-        if st.form_submit_button("💾 Salvar foto", type="primary", width="stretch"):
+        if st.form_submit_button("💾 Salvar foto", type="primary", width="stretch", key=f"midia_salvar_{m['id']}"):
             db.editar_midia_obra(m["id"], sanitize_text(amb, LIM_AMBIENTE) or "Geral",
                                  sanitize_text(titulo, LIM_TAREFA), sanitize_text(descricao, LIMITE_TEXTO_LONGO))
             flash("Foto atualizada.")
@@ -910,6 +999,15 @@ def _excluir_obra_cb(obra_id: int, nome: str) -> None:
     db.excluir_obra(obra_id)
     selecionar_obra(None)
     flash(f"Bloco “{nome}” excluído.")
+
+
+def _retranscrever_cb(registro_id: int, caminho_audio: str) -> None:
+    texto = transcrever_audio_garantido(resolver_caminho(caminho_audio))
+    if texto:
+        db.atualizar_transcricao_registro(registro_id, sanitize_text(texto, LIMITE_TEXTO_LONGO))
+        flash("Áudio transcrito e gravado no registro.")
+    else:
+        flash("Não foi possível reconhecer a fala neste áudio agora. Tente novamente mais tarde.")
 
 
 def _excluir_midia_cb(midia_id: int) -> None:
@@ -992,7 +1090,7 @@ with st.sidebar:
 
     st.divider()
     if security.pin_ativo():
-        st.button("🔒 Bloquear acesso", on_click=security.logout, width="stretch",
+        st.button("🔒 Bloquear acesso", on_click=security.logout, width="stretch", key="btn_bloquear",
                   help="Encerra o acesso neste aparelho. Será preciso digitar o PIN novamente.")
     st.caption("Tema claro/escuro: menu ⋮ > Settings > Theme.")
     st.caption("ObraTrack AI · Diário de obra inteligente para reformas")
@@ -1014,25 +1112,27 @@ if obra_id is None:
         with st.form("form_nova_obra", clear_on_submit=True, enter_to_submit=False, border=False):
             nome = st.text_input(
                 "Nome da Cliente / Obra *", placeholder="Ex.: Reforma Cozinha - Sra. Ana", max_chars=LIM_NOME,
+                key="nova_obra_nome",
                 help="Nome que identifica o bloco. Use o padrão 'Serviço - Cliente'.",
             )
             endereco = st.text_input(
-                "Endereço", placeholder="Rua, número - bairro", max_chars=LIM_ENDERECO,
+                "Endereço", placeholder="Rua, número - bairro", max_chars=LIM_ENDERECO, key="nova_obra_end",
                 help="Endereço da obra. Aparece no cabeçalho do bloco e no relatório do cliente.",
             )
             escopo = st.text_area(
-                "Escopo da Obra", placeholder="Serviços contratados", max_chars=LIM_ESCOPO,
+                "Escopo da Obra", placeholder="Serviços contratados", max_chars=LIM_ESCOPO, key="nova_obra_escopo",
                 help="Serviços, metragens e materiais contratados. Ajuda a IA a identificar ambientes e serviços.",
             )
             c_status, c_inicio = st.columns(2)
             status = c_status.selectbox(
-                "Status", db.STATUS_OBRA, help="Situação atual da obra. Pode ser cadastrada já pausada ou concluída.",
+                "Status", db.STATUS_OBRA, key="nova_obra_status",
+                help="Situação atual da obra. Pode ser cadastrada já pausada ou concluída.",
             )
             inicio = c_inicio.date_input(
-                "Data de início", value=date.today(), format="DD/MM/YYYY",
+                "Data de início", value=date.today(), format="DD/MM/YYYY", key="nova_obra_inicio",
                 help="Data em que a obra começou (ou começará).",
             )
-            criar = st.form_submit_button("Cadastrar e abrir o bloco", type="primary", width="stretch")
+            criar = st.form_submit_button("Cadastrar e abrir o bloco", type="primary", width="stretch", key="nova_obra_salvar")
 
         if criar:
             nome_limpo = sanitize_text(nome, LIM_NOME)
@@ -1068,20 +1168,22 @@ recomendados = db.listar_ambientes_recomendados(obra_id)
 
 c_titulo, c_gerenciar = st.columns([5, 1], vertical_alignment="center")
 c_titulo.title(obra["nome_cliente"])
-with c_gerenciar.popover("⚙️", help="Editar ou excluir este bloco"):
+with c_gerenciar.popover("⚙️", help="Editar ou excluir este bloco", key=f"pop_gerenciar_{obra_id}"):
     with st.form(f"form_edit_obra_{obra_id}", enter_to_submit=False, border=False):
         st.markdown("**Editar bloco**")
-        e_nome = st.text_input("Nome da Cliente / Obra *", value=obra["nome_cliente"], max_chars=LIM_NOME,
+        e_nome = st.text_input("Nome da Cliente / Obra *", value=obra["nome_cliente"], max_chars=LIM_NOME, key=f"edit_obra_nome_{obra_id}",
                                help="Nome exibido no bloco.")
-        e_end = st.text_input("Endereço", value=obra.get("endereco") or "", max_chars=LIM_ENDERECO,
+        e_end = st.text_input("Endereço", value=obra.get("endereco") or "", max_chars=LIM_ENDERECO, key=f"edit_obra_end_{obra_id}",
                               help="Endereço da obra.")
         e_escopo = st.text_area("Escopo da Obra", value=obra.get("escopo_resumo") or "", max_chars=LIM_ESCOPO,
+                                key=f"edit_obra_escopo_{obra_id}",
                                 help="Serviços contratados. Ajuda a IA a identificar ambientes e serviços.")
-        e_status = st.selectbox("Status", db.STATUS_OBRA, index=db.STATUS_OBRA.index(obra["status"]),
+        e_status = st.selectbox("Status", db.STATUS_OBRA, index=db.STATUS_OBRA.index(obra["status"]), key=f"edit_obra_status_{obra_id}",
                                 help="Situação atual da obra.")
         e_inicio = st.date_input("Data de início", value=para_data(obra["data_inicio"]), format="DD/MM/YYYY",
+                                 key=f"edit_obra_inicio_{obra_id}",
                                  help="Data em que a obra começou.")
-        if st.form_submit_button("💾 Salvar bloco", type="primary", width="stretch"):
+        if st.form_submit_button("💾 Salvar bloco", type="primary", width="stretch", key=f"edit_obra_salvar_{obra_id}"):
             if nome_ok := sanitize_text(e_nome, LIM_NOME):
                 db.editar_obra(obra_id, nome_ok, sanitize_text(e_end, LIM_ENDERECO),
                                sanitize_text(e_escopo, LIM_ESCOPO), e_status, e_inicio.isoformat())
@@ -1089,7 +1191,8 @@ with c_gerenciar.popover("⚙️", help="Editar ou excluir este bloco"):
                 st.rerun()
             else:
                 st.error("Informe o nome da cliente/obra.")
-    excluir_bloco = st.button("🗑️ Excluir bloco", width="stretch", help="Apaga a obra e todos os seus dados.")
+    excluir_bloco = st.button("🗑️ Excluir bloco", width="stretch", help="Apaga a obra e todos os seus dados.",
+                              key=f"btn_excluir_bloco_{obra_id}")
 
 # Status da obra (preenchido no fim, junto com os KPIs)
 area_badges = st.empty()
@@ -1129,7 +1232,7 @@ if chaves["ambientes"] in st.session_state:
 filtros_abertos = any(
     st.session_state.get(chaves[n]) for n in ("ambientes", "datas", "atraso")
 ) or st.session_state.get(chaves["status"]) not in (None, "Todas")
-with st.expander("⚙️ Filtros avançados", expanded=filtros_abertos):
+with st.expander("⚙️ Filtros avançados", expanded=filtros_abertos, key=f"exp_filtros_{obra_id}"):
     c1, c2 = st.columns(2)
     f_ambientes = c1.multiselect("Ambiente / Cômodo", ambientes_da_obra, key=chaves["ambientes"],
                                  placeholder="Todos", help="Checklist, registros e fotos destes cômodos.")
@@ -1139,7 +1242,8 @@ with st.expander("⚙️ Filtros avançados", expanded=filtros_abertos):
                             help="Escolha a data inicial e a final. Uma só data filtra a partir dela.")
     f_atraso = st.toggle("Apenas dias com atraso/imprevisto", key=chaves["atraso"],
                          help="Somente registros com justificativa de atraso (chuva, faltas, material...).")
-    st.button("Limpar filtros", on_click=_limpar_filtros, args=(obra_id,), width="stretch")
+    st.button("Limpar filtros", on_click=_limpar_filtros, args=(obra_id,), width="stretch",
+              key=f"btn_limpar_avancado_{obra_id}")
 
 datas = tuple(f_datas) if isinstance(f_datas, (list, tuple)) else ((f_datas,) if f_datas else ())
 filtro = dict(
@@ -1159,7 +1263,7 @@ aba_registro, aba_checklist, aba_historico, aba_galeria = st.tabs([
     "✅ Checklist de Tarefas (Por Ambiente)",
     "📋 Histórico e Diários (Editar/Excluir)",
     "🖼️ Galeria da Obra & Relatórios",
-])
+], key=f"abas_{obra_id}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1170,11 +1274,13 @@ with aba_registro:
     with st.form(f"form_registro_{obra_id}", clear_on_submit=True, enter_to_submit=False):
         audio = st.audio_input(
             "Gravar relato do dia no canteiro",
+            key=f"reg_audio_{obra_id}",
             help="Toque no microfone e conte, cômodo por cômodo, o que foi feito, o que falta, o que "
             "atrasou (chuva, faltas, material) e onde passaram canos/fios.",
         )
         fotos_up = st.file_uploader(
             "Adicionar fotos da reforma / tubulação (pode enviar várias)",
+            key=f"reg_fotos_{obra_id}",
             type=TIPOS_FOTO,
             accept_multiple_files=True,
             help="Fotografe a parede/piso ANTES do reboco ou revestimento, com uma referência de medida. "
@@ -1185,17 +1291,20 @@ with aba_registro:
         c_obs, c_data = st.columns([2, 1])
         obs = c_obs.text_input(
             "Observações rápidas (opcional)",
+            key=f"reg_obs_{obra_id}",
             placeholder="Ex: faltou 1 pedreiro",
             max_chars=LIM_OBS,
             help="Digite uma nota curta ou deixe em branco e fale tudo no áudio.",
         )
         data_reg = c_data.date_input(
             "Data do registro",
+            key=f"reg_data_nova_{obra_id}",
             value=date.today(),
             format="DD/MM/YYYY",
             help="Dia a que o relato se refere. Altere para lançar um dia anterior.",
         )
-        enviar = st.form_submit_button("Processar com IA e Salvar no Bloco", type="primary", width="stretch")
+        enviar = st.form_submit_button("Processar com IA e Salvar no Bloco", type="primary", width="stretch",
+                                       key=f"reg_enviar_{obra_id}")
 
     if enviar:
         obs = sanitize_text(obs, LIM_OBS)
@@ -1271,6 +1380,7 @@ with aba_registro:
                  "caminho_audio": str(caminho_audio) if caminho_audio else None, **dados},
                 tarefas=tarefas_novas,
                 midias=db.listar_midias_obra(obra_id, registro_id=novo_id),
+                contexto="novo",
             )
 
 # Dados completos (KPIs, relatórios, ZIP) e dados filtrados (listas na tela).
@@ -1340,12 +1450,11 @@ def conteudo_dossie(d: dict, prefixo: str) -> None:
             st.info(f"**🔧 Detalhes de execução / imprevistos:** {reg['detalhes_execucao_imprevistos']}")
         if tem_atraso(reg.get("motivo_atraso")):
             st.warning(f"**Justificativa de atraso:** {reg['motivo_atraso']}", icon="⚠️")
-        if audio_d := resolver_caminho(reg.get("caminho_audio")):
+        audio_d = resolver_caminho(reg.get("caminho_audio"))
+        if audio_d:
             st.caption("🎙️ Relato original do canteiro")
             tocar_audio(audio_d)
-        if reg.get("transcricao_audio"):
-            with st.expander("📝 Transcrição do relato"):
-                st.write(reg["transcricao_audio"])
+        bloco_transcricao(reg.get("transcricao_audio"), audio_d is not None)
 
     fotos_d = midias_com_arquivo([
         {**f, "obra_id": d["obra_id"], "tarefa_descricao": d["descricao"], "tarefa_concluida": d["concluida"],
@@ -1414,26 +1523,27 @@ def linha_tarefa(t: dict) -> None:
                     width="stretch", help="Marque quando o serviço estiver feito; desmarque para voltar a pendente.")
         if fotos_t:
             st.caption(f"📷 {len(fotos_t)}", help="Fotos vinculadas a esta tarefa (veja na Galeria da Obra).")
-        with st.popover("✏️", help="Editar texto ou trocar o ambiente (ex.: tarefa que caiu em “Área Externa”)"):
+        with st.popover("✏️", key=f"pop_edit_tarefa_{t['id']}", help="Editar texto ou trocar o ambiente (ex.: tarefa que caiu em “Área Externa”)"):
             with st.form(f"form_edit_tarefa_{t['id']}", enter_to_submit=False, border=False):
-                e_amb = seletor_ambiente("Ambiente", recomendados, atual=t["ambiente"])
-                e_desc = st.text_input("Descrição", value=t["descricao"], max_chars=LIM_TAREFA, help="Texto da tarefa.")
+                e_amb = seletor_ambiente("Ambiente", recomendados, atual=t["ambiente"], key=f"edit_tarefa_amb_{t['id']}")
+                e_desc = st.text_input("Descrição", value=t["descricao"], max_chars=LIM_TAREFA, help="Texto da tarefa.",
+                                       key=f"edit_tarefa_desc_{t['id']}")
                 st.caption("As fotos desta tarefa acompanham a troca de ambiente.")
-                if st.form_submit_button("💾 Salvar", type="primary", width="stretch"):
+                if st.form_submit_button("💾 Salvar", type="primary", width="stretch", key=f"edit_tarefa_salvar_{t['id']}"):
                     if desc_ok := sanitize_text(e_desc, LIM_TAREFA):
                         db.editar_tarefa(t["id"], sanitize_text(e_amb, LIM_AMBIENTE), desc_ok)
                         flash("Tarefa atualizada.")
                         st.rerun()
                     else:
                         st.error("A descrição não pode ficar vazia.")
-        with st.popover("📷", help="Anexar fotos a esta tarefa"):
+        with st.popover("📷", help="Anexar fotos a esta tarefa", key=f"pop_fotos_tarefa_{t['id']}"):
             with st.form(f"form_fotos_tarefa_{t['id']}", clear_on_submit=True, enter_to_submit=False, border=False):
                 st.markdown(f"**Fotos de:** {t['descricao']}")
                 novas = st.file_uploader("Fotos", type=TIPOS_FOTO, accept_multiple_files=True,
                                          key=f"up_tarefa_{t['id']}", help=f"Até {MAX_FOTOS_ENVIO} por envio.")
-                desc_foto = st.text_input("Descrição técnica (opcional)", max_chars=LIM_TAREFA,
+                desc_foto = st.text_input("Descrição técnica (opcional)", max_chars=LIM_TAREFA, key=f"fotos_tarefa_desc_{t['id']}",
                                           placeholder="Ex.: cano de água fria a 30 cm do piso")
-                if st.form_submit_button("📎 Anexar fotos", type="primary", width="stretch"):
+                if st.form_submit_button("📎 Anexar fotos", type="primary", width="stretch", key=f"fotos_tarefa_enviar_{t['id']}"):
                     if not novas:
                         st.error("Escolha ao menos uma foto.")
                     else:
@@ -1460,22 +1570,23 @@ def linha_tarefa(t: dict) -> None:
 with aba_checklist:
     grupos = agrupar_por_ambiente(tarefas)
 
-    with st.expander("➕ Adicionar tarefa", expanded=not tarefas):
+    with st.expander("➕ Adicionar tarefa", expanded=not tarefas, key=f"exp_nova_tarefa_{obra_id}"):
         with st.form(f"form_nova_tarefa_{obra_id}", clear_on_submit=True, enter_to_submit=False, border=False):
             c_amb, c_desc = st.columns([1, 2])
             with c_amb:
-                nova_amb = seletor_ambiente("Ambiente", recomendados)
+                nova_amb = seletor_ambiente("Ambiente", recomendados, key=f"nova_tarefa_amb_{obra_id}")
             nova_desc = c_desc.text_input(
                 "Descrição", placeholder="Ex: Assentar porcelanato", max_chars=LIM_TAREFA,
+                key=f"nova_tarefa_desc_{obra_id}",
                 help="Atividade curta e objetiva.",
             )
-            nova_ok = st.checkbox("Já concluída", help="Marque se a tarefa já foi executada.")
+            nova_ok = st.checkbox("Já concluída", help="Marque se a tarefa já foi executada.", key=f"nova_tarefa_ok_{obra_id}")
             novas_fotos = st.file_uploader(
                 "Fotos desta tarefa (opcional)", type=TIPOS_FOTO, accept_multiple_files=True,
                 key=f"up_nova_tarefa_{obra_id}",
                 help="As fotos entram na Galeria da Obra já no ambiente e no serviço desta tarefa.",
             )
-            if st.form_submit_button("Adicionar ao checklist", width="stretch"):
+            if st.form_submit_button("Adicionar ao checklist", width="stretch", key=f"nova_tarefa_salvar_{obra_id}"):
                 if desc_ok := sanitize_text(nova_desc, LIM_TAREFA):
                     amb_ok = sanitize_text(nova_amb, LIM_AMBIENTE) or db.detectar_ambiente(desc_ok, obra.get("escopo_resumo") or "")
                     tid = db.inserir_tarefa(obra_id, None, amb_ok, desc_ok, int(nova_ok))
@@ -1574,7 +1685,7 @@ def form_adicionar_fotos(chave: str, ambiente_fixo: str | None = None) -> None:
                                  placeholder="Ex.: tubo de água quente a 30 cm do piso, lado esquerdo")
         arquivos = st.file_uploader("Fotos", type=TIPOS_FOTO, accept_multiple_files=True, key=f"{chave}_up",
                                     help=f"Até {MAX_FOTOS_ENVIO} por envio. A localização e os dados do celular são removidos.")
-        if st.form_submit_button("📎 Adicionar fotos", type="primary", width="stretch"):
+        if st.form_submit_button("📎 Adicionar fotos", type="primary", width="stretch", key=f"{chave}_enviar"):
             tarefa = next((t for t in tarefas if t["id"] == tarefa_id), None)
             amb_ok = sanitize_text(amb, LIM_AMBIENTE) or (tarefa["ambiente"] if tarefa else "")
             if not arquivos:
@@ -1601,6 +1712,7 @@ with aba_galeria:
     if todas_fotos:
         st.download_button(
             "📦 Baixar Fotos da Obra Separadas por Pasta de Ambiente (.ZIP)",
+            key=f"dl_zip_{obra_id}",
             # Gerado só no clique: subpastas por ambiente + memorial descritivo.
             data=partial(gerar_zip_asbuilt, obra, registros, tarefas, midias_obra),
             file_name=f"fotos_obra_{obra_id}_{date.today():%Y%m%d}.zip",
@@ -1611,7 +1723,7 @@ with aba_galeria:
             help="Todas as fotos em pastas por cômodo (Banheiro_Social/01_2026-11-11_retirada_da_ceramica.jpg, "
             "Cozinha/...) e o Memorial_Descritivo_AsBuilt.txt com a descrição técnica de cada foto.",
         )
-    with st.expander("➕ Adicionar fotos na galeria", expanded=not todas_fotos):
+    with st.expander("➕ Adicionar fotos na galeria", expanded=not todas_fotos, key=f"exp_galeria_nova_{obra_id}"):
         form_adicionar_fotos(f"form_galeria_nova_{obra_id}")
 
     if not todas_fotos:
@@ -1652,8 +1764,9 @@ with aba_galeria:
                         unsafe_allow_html=True,
                     )
                     grade_fotos(itens, prefixo=f"gal_{obra_id}")
-                with st.popover(f"➕ Adicionar mais fotos em {ambiente}", width="stretch"):
-                    form_adicionar_fotos(f"form_galeria_{obra_id}_{slug(ambiente, '_')}", ambiente_fixo=ambiente)
+                with st.popover(f"➕ Adicionar mais fotos em {ambiente}", width="stretch",
+                                key=f"pop_galeria_{obra_id}_{chave_ambiente(ambiente)}"):
+                    form_adicionar_fotos(f"form_galeria_{obra_id}_{chave_ambiente(ambiente)}", ambiente_fixo=ambiente)
 
     st.divider()
     st.subheader(
@@ -1664,6 +1777,7 @@ with aba_galeria:
     st.code(gerar_resumo_whatsapp(obra, registros, tarefas), language=None, wrap_lines=True)
     st.download_button(
         "📥 Baixar Relatório Completo (.html / Imprimível em PDF)",
+        key=f"dl_relatorio_{obra_id}",
         # Gerado só no clique (fotos embutidas deixam o arquivo pesado).
         data=partial(gerar_relatorio_html, obra, registros, tarefas, midias_obra),
         file_name=f"relatorio_obra_{obra_id}_{date.today():%Y%m%d}.html",

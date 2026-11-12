@@ -21,7 +21,7 @@ from google.genai import errors, types
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError
 
-from database import corrigir_ambiente
+from database import ASBUILT_FOTO_SEM_DESCRICAO, SEM_FOTO_ASBUILT, corrigir_ambiente
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -59,6 +59,17 @@ CODIGOS_RETRY_MESMO_MODELO = {429, 503}
 PLACEHOLDER_CHAVE = "sua_chave_aqui"
 SEM_ATRASO = "Sem atrasos registrados"
 SEM_PARTICULARIDADES = "Execução sem particularidades relatadas"
+TRANSCRICAO_INDISPONIVEL = (
+    "Transcrição automática indisponível para este registro. Ouça o relato original no "
+    "player ou edite o registro para incluir a transcrição."
+)
+
+# Reconhecimento de fala dedicado (SpeechRecognition + serviço gratuito de voz do Google).
+# Lê WAV/AIFF/FLAC (o st.audio_input grava WAV) em trechos, pois o serviço só aceita
+# áudios curtos por requisição.
+FORMATOS_STT = {".wav", ".aif", ".aiff", ".flac"}
+TRECHO_STT_SEGUNDOS = 45
+TIMEOUT_STT_SEGUNDOS = 30
 AVISO_ANALISE_SIMPLIFICADA = (
     "A análise automática não está disponível no momento. O registro foi salvo com uma "
     "análise simplificada — você pode revisá-lo e editá-lo no Histórico."
@@ -201,7 +212,8 @@ INSTRUCAO_SISTEMA = f"""Você é um engenheiro civil responsável pelo diário d
 Responda sempre em português do Brasil e preencha TODOS os campos do schema.
 
 Regras obrigatórias:
-1) transcricao_audio: transcrição LITERAL e COMPLETA de tudo o que foi falado no áudio, do início ao fim, sem resumir, sem omitir trechos e sem corrigir o sentido (mantenha gírias e termos de obra). Sem áudio: string vazia.
+1) transcricao_audio: transcrição LITERAL e COMPLETA de tudo o que foi falado no áudio, do início ao fim, sem resumir, sem omitir trechos e sem corrigir o sentido (mantenha gírias e termos de obra). Se o prompt trouxer uma TRANSCRIÇÃO LITERAL DO ÁUDIO, use-a como base (pode apenas pontuar e corrigir palavras claramente mal reconhecidas, ouvindo o áudio). Sem áudio: string vazia.
+   Todos os demais campos (resumo, detalhes, tarefas, ambientes) devem refletir FIELMENTE o que foi falado: cada serviço citado no áudio vira um item em tarefas_extraidas; não invente nem omita serviços.
 2) tarefas_extraidas: quebre CADA atividade mencionada em um bloco individual, separado por cômodo/ambiente. Se a fala citar duas atividades em ambientes diferentes, gere dois blocos distintos. Exemplo: "tirei a cerâmica do banheiro social e passei cano na cozinha" →
    [{{"ambiente": "Banheiro Social", "descricao": "Retirada da cerâmica antiga", "concluida": true}},
     {{"ambiente": "Cozinha", "descricao": "Passagem de tubulação hidráulica", "concluida": true}}].
@@ -215,7 +227,8 @@ Regras obrigatórias:
 """
 
 
-def _montar_prompt(contexto_obra: str, observacoes_texto: str, tem_audio: bool, qtd_fotos: int) -> str:
+def _montar_prompt(contexto_obra: str, observacoes_texto: str, tem_audio: bool, qtd_fotos: int,
+                   transcricao_literal: str = "") -> str:
     fontes = []
     if tem_audio:
         fontes.append("um ÁUDIO com o relato do trabalhador (fonte principal)")
@@ -226,8 +239,13 @@ def _montar_prompt(contexto_obra: str, observacoes_texto: str, tem_audio: bool, 
     if observacoes_texto:
         fontes.append("OBSERVAÇÕES escritas")
     fontes_txt = ", ".join(fontes) if fontes else "nenhuma mídia (apenas o contexto)"
+    literal = (
+        f"TRANSCRIÇÃO LITERAL DO ÁUDIO (reconhecimento de fala pt-BR, sem pontuação):\n\"{transcricao_literal}\"\n\n"
+        if transcricao_literal else ""
+    )
     return (
         f"CONTEXTO DA OBRA:\n{contexto_obra or 'Não informado.'}\n\n"
+        f"{literal}"
         f"OBSERVAÇÕES ESCRITAS DO DIA:\n{observacoes_texto or 'Nenhuma.'}\n\n"
         f"Você recebeu: {fontes_txt}. Analise seguindo as regras do sistema."
     )
@@ -312,6 +330,52 @@ def _gerar_com_fallback(client: genai.Client, contents: list) -> AnaliseDiarioOb
 
 
 # --------------------------------------------------------------------------- #
+# Transcrição dedicada (Speech-to-Text pt-BR), independente da IA
+# --------------------------------------------------------------------------- #
+def transcrever_audio_garantido(caminho_audio: Optional[str | Path]) -> str:
+    """Transcrição literal, em português, do que foi falado no áudio.
+
+    Usa SpeechRecognition (`recognize_google`, gratuito e sem chave), lendo o arquivo em
+    trechos de ~45 s. Trechos de silêncio/inaudíveis são pulados. Retorna "" se não houver
+    fala reconhecível, se o formato não for suportado ou se o serviço estiver fora do ar —
+    nunca levanta exceção (o registro sempre pode ser salvo).
+    """
+    if not caminho_audio:
+        return ""
+    caminho = Path(caminho_audio)
+    if not caminho.is_file() or caminho.suffix.lower() not in FORMATOS_STT:
+        log.warning("Transcrição dedicada ignorada (arquivo ausente ou formato %s).", caminho.suffix)
+        return ""
+    try:
+        import speech_recognition as sr
+    except ImportError:
+        log.error("Pacote SpeechRecognition não instalado; transcrição dedicada indisponível.")
+        return ""
+
+    reconhecedor = sr.Recognizer()
+    reconhecedor.operation_timeout = TIMEOUT_STT_SEGUNDOS
+    partes: list[str] = []
+    try:
+        with sr.AudioFile(str(caminho)) as fonte:
+            restante = fonte.DURATION or 0
+            while restante > 0.3:
+                trecho = reconhecedor.record(fonte, duration=min(TRECHO_STT_SEGUNDOS, restante))
+                restante -= TRECHO_STT_SEGUNDOS
+                try:
+                    texto = reconhecedor.recognize_google(trecho, language="pt-BR")
+                except sr.UnknownValueError:
+                    continue  # trecho sem fala reconhecível
+                if isinstance(texto, str) and texto.strip():
+                    partes.append(texto.strip())
+    except sr.RequestError as exc:
+        log.error("Serviço de transcrição indisponível (%s).", exc)
+    except Exception as exc:  # arquivo corrompido, timeout etc.
+        log.error("Falha na transcrição dedicada (%s: %s).", type(exc).__name__, exc)
+    texto = " ".join(partes).strip()
+    return texto[:1].upper() + texto[1:] if texto else ""
+
+
+# --------------------------------------------------------------------------- #
 # Análise offline (regras locais) — usada só se TODA a cadeia de IA falhar
 # --------------------------------------------------------------------------- #
 _REGRAS_ATRASO = [
@@ -323,29 +387,63 @@ _REGRAS_ATRASO = [
     (r"vazament|quebr|defeito|problema|imprevist|infiltra|rachadura|trinca|cano\s+estourad|sem\s+(?:energia|luz|[aá]gua)",
      "Problema técnico/imprevisto identificado em campo, exigindo correção antes da continuidade"),
 ]
+_REGRAS_DETALHES = [
+    (r"\bpedra|rocha|rochos|terreno\s+duro|solo\s+duro|rompedor", "Terreno com rocha/pedra, exigindo escavação mais lenta"),
+    (r"len[çc]ol|minando\s+[aá]gua|encharc|lama|barro", "Solo úmido/encharcado (água no terreno) durante a execução"),
+    (r"\bcura\b|secagem|secar|esperar\s+(?:o\s+)?(?:concreto|reboco|massa|argamassa)", "Etapa depende de tempo de cura/secagem do material"),
+    (r"viga|pilar|ferragem|ferro\s+expost|estrutura|laje", "Interferência com a estrutura (viga/pilar/laje) exigiu cuidado adicional"),
+    (r"tubula[çc][aã]o\s+antiga|cano\s+antigo|fia[çc][aã]o\s+antiga|instala[çc][aã]o\s+antiga", "Instalações antigas encontradas na abertura, exigindo adequação"),
+]
 _SINAIS_PARALISACAO = r"paramos|parou|paralis|suspens|n[aã]o\s+(?:trabalhamos|deu\s+para|foi\s+poss[ií]vel)|sem\s+trabalho"
 _SINAIS_PENDENTE = r"\b(?:falta|faltou|precisa|amanh[aã]|vamos|vai\s+ser|pendente|ainda\s+n[aã]o|depois)\b"
+# Fala transcrita vem sem pontuação: além de vírgula/ponto, quebra antes de conectivos
+# ("depois", "amanhã", "também"...) e de "e"/"eu"/"a gente" seguidos de verbo no passado.
+_VERBO_FALA = r"\w+(?:ei|amos|ou|emos|imos|i|aram|eram|iram)\b"
+_SEPARADORES_FALA = (
+    r"[;,.!?]|\s+e\s+(?=(?:(?:eu|a\s+gente|n[oó]s|o\s+\w+)\s+)?" + _VERBO_FALA + ")"
+    r"|\s+(?=(?:depois|ent[aã]o|a[ií]|tamb[eé]m|amanh[aã]|em\s+seguida|al[eé]m\s+disso|agora)\b)"
+)
+_PREFIXOS_FALA = r"^(?:e|ent[aã]o|a[ií]|depois|tamb[eé]m|em\s+seguida|al[eé]m\s+disso|agora|hoje|eu|a\s+gente|n[oó]s|n[eé])\b\s*"
+LIMITE_DESCRICAO_TAREFA = 200
+# "vala/poço de infiltração" é serviço (sistema de esgoto), não infiltração de água (problema).
+_SERVICO_INFILTRACAO = r"(?:valas?|po[çc]os?|sistema|campo|caixa)\s+de\s+infiltra\w*"
+# Intenção futura no início da tarefa pendente ("amanhã vamos assentar..." → "Assentar...").
+_PREFIXO_PENDENTE = r"^(?:amanh[aã]\s+)?(?:a\s+gente\s+|n[oó]s\s+|eu\s+)?(?:vamos|vai|vou|precisa(?:mos)?|falta)\s+(?:a\s+gente\s+)?"
+
+
+def _texto_para_atraso(texto: str) -> str:
+    return re.sub(_SERVICO_INFILTRACAO, " ", texto, flags=re.IGNORECASE)
+
+
 def _tarefas_por_regras(obs: str, contexto_obra: str = "") -> list[ItemTarefa]:
     """Quebra a observação em atividades (por vírgula, ';', ' e ') e infere o ambiente.
 
     O ambiente vem do cômodo citado no trecho; sem cômodo, de um cômodo citado no resto do
     relato (serviços internos como cerâmica/piso/cano) ou do escopo da obra.
     """
-    partes = re.split(r"[;,.]|\s+e\s+(?=\w+(?:ei|amos|ou|emos|imos|i)\b)", obs, flags=re.IGNORECASE)
+    partes = re.split(_SEPARADORES_FALA, obs, flags=re.IGNORECASE)
     tarefas = []
-    for parte in (p.strip() for p in partes):
-        baixa = parte.lower()
+    for parte in (p.strip() for p in partes if p):
+        # Vícios de fala no início do trecho ("e aí eu tirei..." → "tirei...").
+        while (limpo := re.sub(_PREFIXOS_FALA, "", parte, count=1, flags=re.IGNORECASE).strip()) != parte:
+            parte = limpo
+        baixa = _texto_para_atraso(parte.lower())
         if (
             len(parte) < 6
             or any(re.search(padrao, baixa) for padrao, _ in _REGRAS_ATRASO)
             or re.search(_SINAIS_PARALISACAO, baixa)
         ):
             continue  # ignora fragmentos e frases que são atraso/paralisação, não atividade
+        concluida = not re.search(_SINAIS_PENDENTE, parte.lower())
+        if not concluida:
+            parte = re.sub(_PREFIXO_PENDENTE, "", parte, flags=re.IGNORECASE).strip() or parte
+        if len(parte) < 6:
+            continue
         tarefas.append(
             ItemTarefa(
                 ambiente=corrigir_ambiente("Geral", parte, obs, contexto_obra),
-                descricao=parte[0].upper() + parte[1:],
-                concluida=not re.search(_SINAIS_PENDENTE, parte.lower()),
+                descricao=(parte[0].upper() + parte[1:])[:LIMITE_DESCRICAO_TAREFA],
+                concluida=concluida,
             )
         )
     return tarefas
@@ -364,15 +462,19 @@ def gerar_analise_offline(
     contexto_obra: str = "",
     tem_audio: bool = False,
     caminho_foto: Optional[Path | list[Path]] = None,
+    transcricao: str = "",
 ) -> AnaliseDiarioObra:
     """Gera uma análise estruturada por regras locais, sem chamar a IA.
 
+    `transcricao` (texto real falado no áudio) e as observações escritas formam o relato do
+    dia: dele saem o resumo, os detalhes/imprevistos, o atraso e as tarefas por ambiente.
     `caminho_foto` aceita uma foto ou uma lista de fotos. As fotos não são classificadas
     aqui (fotos_classificadas fica vazia); quem salva usa as tarefas para vinculá-las.
     """
     fotos = _lista_fotos(caminho_foto)
-    obs = (observacoes_texto or "").strip()
-    texto = obs.lower()
+    transcricao = (transcricao or "").strip()
+    obs = ". ".join(t for t in (transcricao, (observacoes_texto or "").strip()) if t)
+    texto = _texto_para_atraso(obs.lower())
 
     causas = [descricao for padrao, descricao in _REGRAS_ATRASO if re.search(padrao, texto)]
     paralisou = bool(re.search(_SINAIS_PARALISACAO, texto))
@@ -386,7 +488,7 @@ def gerar_analise_offline(
     else:
         motivo = SEM_ATRASO
 
-    detalhes = [d for d in causas]
+    detalhes = [d for padrao, d in _REGRAS_DETALHES if re.search(padrao, texto)] + causas
     if paralisou:
         detalhes.append("Houve paralisação dos serviços durante o dia")
     detalhes_txt = ("; ".join(detalhes) + ".") if detalhes else SEM_PARTICULARIDADES
@@ -395,7 +497,16 @@ def gerar_analise_offline(
         (linha.split(":", 1)[1].strip() for linha in contexto_obra.splitlines() if linha.lower().startswith("escopo")),
         "",
     )
-    if obs:
+    tarefas = _tarefas_por_regras(obs, contexto_obra)
+    feitas = [f"{t.descricao} ({t.ambiente})" for t in tarefas if t.concluida]
+    pendentes = [f"{t.descricao} ({t.ambiente})" for t in tarefas if not t.concluida]
+    if feitas or pendentes:
+        resumo = ""
+        if feitas:
+            resumo += "Serviços executados no dia: " + "; ".join(feitas) + "."
+        if pendentes:
+            resumo += (" " if resumo else "") + "Serviços previstos/pendentes: " + "; ".join(pendentes) + "."
+    elif obs:
         resumo = f"Registro do dia: {obs[0].upper()}{obs[1:]}"
         resumo += "" if resumo.endswith(".") else "."
     else:
@@ -410,22 +521,15 @@ def gerar_analise_offline(
             "fiação pode ser completada na Galeria da Obra ou editando este registro."
         )
     else:
-        asbuilt = "Sem foto para mapeamento As-Built"
-
-    transcricao = (
-        "Transcrição automática indisponível para este registro. Ouça o relato original no "
-        "player ou edite o registro para incluir a transcrição."
-        if tem_audio
-        else ""
-    )
+        asbuilt = SEM_FOTO_ASBUILT
 
     analise = AnaliseDiarioObra(
-        transcricao_audio=transcricao,
+        transcricao_audio=transcricao or (TRANSCRICAO_INDISPONIVEL if tem_audio else ""),
         resumo_executivo=resumo,
         detalhes_execucao_imprevistos=detalhes_txt,
         motivo_atraso=motivo,
         mapeamento_asbuilt=asbuilt,
-        tarefas_extraidas=_tarefas_por_regras(obs, contexto_obra),
+        tarefas_extraidas=tarefas,
     )
     analise._modo_offline = True
     analise._aviso = AVISO_ANALISE_SIMPLIFICADA
@@ -474,8 +578,12 @@ def processar_registro_obra(
     if not (audio_path or fotos or observacoes_texto):
         raise ValueError("Envie pelo menos um áudio, uma foto ou observações em texto.")
 
+    # 1º passo, sempre: o texto real falado no áudio (independe da IA estar disponível).
+    transcricao_literal = transcrever_audio_garantido(audio_path) if audio_path else ""
+
     def offline() -> AnaliseDiarioObra:
-        return gerar_analise_offline(observacoes_texto, contexto_obra, audio_path is not None, fotos)
+        return gerar_analise_offline(observacoes_texto, contexto_obra, audio_path is not None, fotos,
+                                     transcricao=transcricao_literal)
 
     if modo_offline if modo_offline is not None else modo_offline_forcado():
         return offline()
@@ -503,9 +611,17 @@ def processar_registro_obra(
         for i, foto in enumerate(fotos, start=1):
             contents += [f"FOTO {i}:", _carregar_foto(foto)]
         contents.append(
-            _montar_prompt(contexto_obra, observacoes_texto, tem_audio=audio_path is not None, qtd_fotos=len(fotos))
+            _montar_prompt(contexto_obra, observacoes_texto, tem_audio=audio_path is not None, qtd_fotos=len(fotos),
+                           transcricao_literal=transcricao_literal)
         )
         analise = _gerar_com_fallback(client, contents)
+        if transcricao_literal:
+            # O campo guarda o que foi falado de fato (reconhecimento de fala dedicado).
+            analise.transcricao_audio = transcricao_literal
+        elif audio_path and not analise.transcricao_audio.strip():
+            analise.transcricao_audio = TRANSCRICAO_INDISPONIVEL
+        if fotos and SEM_FOTO_ASBUILT.lower() in analise.mapeamento_asbuilt.lower():
+            analise.mapeamento_asbuilt = ASBUILT_FOTO_SEM_DESCRICAO
         relato = f"{analise.transcricao_audio} {observacoes_texto}"
         analise = _corrigir_ambientes(analise, relato, contexto_obra, len(fotos))
         log.info("Registro analisado com %s.", analise.modelo)

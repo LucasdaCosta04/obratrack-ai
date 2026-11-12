@@ -25,7 +25,8 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
    - **Busca Global na Obra**: procura em ambiente, tarefa, transcrição, resumo e detalhes do dia, atrasos e serviço/descrição das fotos, sem diferenciar maiúsculas nem acentos. Os **filtros avançados** combinam ambiente, status da tarefa, intervalo de datas e "apenas dias com atraso", e valem para o checklist, o histórico e a galeria. O botão **✖️ Limpar Filtros**, ao lado da busca, zera tudo de uma vez.
    - **🔎 Resultados Encontrados (Dossiê Completo)**: ao digitar uma busca (ex.: "vala de infiltração") ou escolher um filtro, aparece logo abaixo da barra um card por tarefa encontrada, com tudo no mesmo lugar: status (✅ Concluída / ⏳ Pendente), ambiente e **📅 Realizado em: DD/MM/AAAA**; o resumo, os detalhes de execução/imprevistos, a justificativa de atraso, a transcrição e o áudio do dia; e as fotos do serviço com legenda As-Built e opção de ampliar. Os dados vêm de `database.buscar_dossie_tarefas`, que faz `LEFT JOIN` da tarefa com o registro diário (de origem ou do mesmo dia) e com as fotos (da tarefa, ou soltas do mesmo ambiente e registro/dia).
 2. **Novo Registro**: grava o áudio pelo navegador do celular, anexa **uma ou várias fotos** e uma observação opcional. Cada foto vai para a Galeria já no ambiente e no serviço do relato ("foi retirado a cerâmica do banheiro" + 2 fotos → 2 fotos em **Banheiro**, serviço "Retirada da cerâmica...").
-3. **IA multimodal (Gemini 3.x Flash)**: cruza o relato, as fotos e o **contexto da obra** e devolve um JSON validado:
+3. **Transcrição garantida do áudio (pt-BR)**: antes de qualquer análise, `ai_service.transcrever_audio_garantido` converte a fala em texto com a biblioteca `SpeechRecognition` (reconhecimento de voz gratuito do Google, em trechos de 45 s). Esse texto literal vai para `transcricao_audio`, aparece aberto logo abaixo do player (🎙️ *O que foi falado no áudio: "..."*) e é a base do resumo, dos detalhes e das tarefas, com ou sem IA. Sem IA disponível, as regras locais quebram a fala (sem pontuação) em tarefas por cômodo. Registros antigos sem transcrição ganham o botão **🔄 Transcrever o áudio agora**. O áudio é enviado ao serviço de voz do Google, por isso é preciso internet.
+   **IA multimodal (Gemini 3.x Flash)**: recebe a transcrição literal junto com o áudio e as fotos, cruza tudo com o **contexto da obra** e devolve um JSON validado:
    - `transcricao_audio`: transcrição literal e completa do relato;
    - `tarefas_extraidas`: cada atividade falada vira um bloco **por cômodo** ("tirei a cerâmica do banheiro social e passei cano na cozinha" → 2 tarefas), marcada como feita ou pendente;
    - `resumo_executivo`: atividades do dia em linguagem técnica para a cliente;
@@ -51,6 +52,9 @@ Só dados objetivos, sem nota subjetiva do dia:
 - **Tarefas Concluídas / Total**: ex.: 7/12.
 - **Dias Registrados**: dias distintos com registro no diário.
 - **Fotos Mapeadas (As-Built)**: fotos técnicas na Galeria da Obra.
+
+### Estabilidade no navegador
+O tradutor automático do Chrome alterava textos ("anéis" → "animais") e nós do DOM controlados pelo React, derrubando a tela com `NotFoundError: removeChild`. Um script num iframe invisível marca a página como `lang="pt-BR"`, `translate="no"` e `class="notranslate"`, com a meta `google=notranslate`. Todos os widgets têm `key` única e estável.
 
 ## 3. Arquitetura
 

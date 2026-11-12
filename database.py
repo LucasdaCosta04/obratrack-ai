@@ -351,6 +351,7 @@ def _migrar(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tarefas_obra ADD COLUMN data_conclusao TEXT")
     _sanear_textos_legados(conn)
     _migrar_fotos_para_midias(conn)
+    _corrigir_asbuilt_sem_foto(conn)
 
 
 def _migrar_fotos_para_midias(conn: sqlite3.Connection) -> int:
@@ -420,6 +421,30 @@ _SUBSTITUICOES_LEGADAS = [
      "A descrição da posição de tubulações, conduítes e fiação pode ser completada editando este registro."),
     ("resumo_executivo", "[Modo Demonstração] ", ""),
 ]
+
+
+SEM_FOTO_ASBUILT = "Sem foto para mapeamento As-Built"
+ASBUILT_FOTO_SEM_DESCRICAO = (
+    "Fotos do dia arquivadas como evidência As-Built. A descrição da posição de tubulações, "
+    "conduítes e fiação pode ser completada na Galeria da Obra."
+)
+
+
+def _corrigir_asbuilt_sem_foto(conn: sqlite3.Connection) -> None:
+    """Migração idempotente: "Sem foto para mapeamento As-Built" não pode aparecer quando
+    há foto. Limpa a descrição das fotos que herdaram essa frase e ajusta o registro."""
+    conn.execute(
+        "UPDATE midias_obra SET descricao_tecnica = '' WHERE TRIM(descricao_tecnica) = ?", (SEM_FOTO_ASBUILT,)
+    )
+    conn.execute(
+        """
+        UPDATE registros_diarios SET mapeamento_asbuilt = ?
+        WHERE TRIM(mapeamento_asbuilt) = ?
+          AND (TRIM(COALESCE(caminho_foto, '')) <> ''
+               OR EXISTS (SELECT 1 FROM midias_obra m WHERE m.registro_id = registros_diarios.id))
+        """,
+        (ASBUILT_FOTO_SEM_DESCRICAO, SEM_FOTO_ASBUILT),
+    )
 
 
 def _sanear_textos_legados(conn: sqlite3.Connection) -> None:
@@ -720,6 +745,15 @@ def atualizar_registro_diario(
                 mapeamento_asbuilt,
                 registro_id,
             ),
+        )
+        return cur.rowcount > 0
+
+
+def atualizar_transcricao_registro(registro_id: int, transcricao_audio: str) -> bool:
+    """Grava a transcrição do áudio de um registro (ex.: áudio transcrito de novo). False se não existir."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE registros_diarios SET transcricao_audio = ? WHERE id = ?", (transcricao_audio, registro_id)
         )
         return cur.rowcount > 0
 

@@ -8,10 +8,14 @@ Detalhes técnicos de falhas vão apenas para o log do servidor.
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import re
+import subprocess
+import tempfile
 import time
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -21,7 +25,15 @@ from google.genai import errors, types
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError
 
-from database import ASBUILT_FOTO_SEM_DESCRICAO, SEM_FOTO_ASBUILT, corrigir_ambiente
+from database import (
+    AMBIENTES_EXTERNOS,
+    ASBUILT_FOTO_SEM_DESCRICAO,
+    SEM_FOTO_ASBUILT,
+    ambientes_citados,
+    corrigir_ambiente,
+    eh_servico_interno,
+    normalizar_busca,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -65,10 +77,13 @@ TRANSCRICAO_INDISPONIVEL = (
 )
 
 # Reconhecimento de fala dedicado (SpeechRecognition + serviço gratuito de voz do Google).
-# Lê WAV/AIFF/FLAC (o st.audio_input grava WAV) em trechos, pois o serviço só aceita
-# áudios curtos por requisição.
-FORMATOS_STT = {".wav", ".aif", ".aiff", ".flac"}
-TRECHO_STT_SEGUNDOS = 45
+# Todo áudio é convertido para WAV PCM 16 kHz mono (ffmpeg do imageio-ffmpeg, via pydub) e
+# dividido em trechos de até 35 s — o serviço recusa/ignora áudios longos numa só requisição.
+# O corte é feito num silêncio perto do fim do trecho, para não partir palavras.
+TRECHO_STT_MS = 35_000
+JANELA_CORTE_MS = 8_000          # procura silêncio nos últimos 8 s de cada trecho
+SILENCIO_MIN_MS = 350
+TAXA_STT_HZ = 16_000
 TIMEOUT_STT_SEGUNDOS = 30
 AVISO_ANALISE_SIMPLIFICADA = (
     "A análise automática não está disponível no momento. O registro foi salvo com uma "
@@ -103,7 +118,19 @@ class ItemTarefa(BaseModel):
     ambiente: str = Field(
         description="Cômodo ou área da obra (ex.: 'Banheiro Social', 'Cozinha', 'Muro'). Use 'Geral' se não for citado."
     )
-    descricao: str = Field(description="Atividade em uma frase curta e técnica (ex.: 'Retirada da cerâmica antiga').")
+    descricao: str = Field(description="Título curto da tarefa para o checklist (ex.: 'Retirada da cerâmica antiga').")
+    resumo_servico: str = Field(
+        description=(
+            "O que foi explicado no áudio especificamente sobre ESTE serviço/ambiente, em linguagem técnica. "
+            "Nunca inclua outros serviços ou cômodos falados no mesmo relato."
+        )
+    )
+    detalhes_servico: str = Field(
+        description=(
+            "Detalhes técnicos de execução e particularidades DESTE serviço (materiais, medidas, dificuldades "
+            f"do terreno/estrutura). Sem detalhes, escreva '{SEM_PARTICULARIDADES}'."
+        )
+    )
     concluida: bool = Field(
         description="True se o relato diz que foi feito hoje; False se diz que ainda falta fazer ou ficou pendente."
     )
@@ -214,6 +241,7 @@ Responda sempre em português do Brasil e preencha TODOS os campos do schema.
 Regras obrigatórias:
 1) transcricao_audio: transcrição LITERAL e COMPLETA de tudo o que foi falado no áudio, do início ao fim, sem resumir, sem omitir trechos e sem corrigir o sentido (mantenha gírias e termos de obra). Se o prompt trouxer uma TRANSCRIÇÃO LITERAL DO ÁUDIO, use-a como base (pode apenas pontuar e corrigir palavras claramente mal reconhecidas, ouvindo o áudio). Sem áudio: string vazia.
    Todos os demais campos (resumo, detalhes, tarefas, ambientes) devem refletir FIELMENTE o que foi falado: cada serviço citado no áudio vira um item em tarefas_extraidas; não invente nem omita serviços.
+2b) SEPARAÇÃO DE SERVIÇOS: quando o mesmo relato fala de serviços em ambientes diferentes (ex.: banheiro/cerâmica/encanamento E vala/fossa/anéis/sumidouro), gere itens SEPARADOS — um com ambiente "Banheiro" e outro com ambiente "Área Externa". Em cada item, resumo_servico e detalhes_servico falam SOMENTE daquele serviço/ambiente (nada da vala no item do banheiro e vice-versa). O resumo_executivo do dia cobre tudo o que foi explicado.
 2) tarefas_extraidas: quebre CADA atividade mencionada em um bloco individual, separado por cômodo/ambiente. Se a fala citar duas atividades em ambientes diferentes, gere dois blocos distintos. Exemplo: "tirei a cerâmica do banheiro social e passei cano na cozinha" →
    [{{"ambiente": "Banheiro Social", "descricao": "Retirada da cerâmica antiga", "concluida": true}},
     {{"ambiente": "Cozinha", "descricao": "Passagem de tubulação hidráulica", "concluida": true}}].
@@ -332,19 +360,78 @@ def _gerar_com_fallback(client: genai.Client, contents: list) -> AnaliseDiarioOb
 # --------------------------------------------------------------------------- #
 # Transcrição dedicada (Speech-to-Text pt-BR), independente da IA
 # --------------------------------------------------------------------------- #
-def transcrever_audio_garantido(caminho_audio: Optional[str | Path]) -> str:
-    """Transcrição literal, em português, do que foi falado no áudio.
+def _ffmpeg() -> Optional[str]:
+    try:
+        import imageio_ffmpeg
 
-    Usa SpeechRecognition (`recognize_google`, gratuito e sem chave), lendo o arquivo em
-    trechos de ~45 s. Trechos de silêncio/inaudíveis são pulados. Retorna "" se não houver
-    fala reconhecível, se o formato não for suportado ou se o serviço estiver fora do ar —
-    nunca levanta exceção (o registro sempre pode ser salvo).
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        log.error("ffmpeg indisponível para converter o áudio (%s).", exc)
+        return None
+
+
+def _carregar_audio_pcm(caminho: Path):
+    """Qualquer áudio gravado no navegador/celular → pydub.AudioSegment PCM 16 kHz mono 16 bits."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # pydub avisa que não achou ffmpeg no PATH (usamos o do imageio)
+        from pydub import AudioSegment
+    exe = _ffmpeg()
+    if exe:
+        AudioSegment.converter = exe
+    if caminho.suffix.lower() == ".wav":
+        try:
+            audio = AudioSegment.from_wav(str(caminho))  # leitura nativa, sem ffmpeg
+            return audio.set_frame_rate(TAXA_STT_HZ).set_channels(1).set_sample_width(2)
+        except Exception:
+            pass  # WAV não-PCM (ex.: float/ADPCM): converte com ffmpeg abaixo
+    if not exe:
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        saida = Path(tmp) / "audio_pcm.wav"
+        proc = subprocess.run(
+            [exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(caminho),
+             "-ac", "1", "-ar", str(TAXA_STT_HZ), "-sample_fmt", "s16", "-f", "wav", str(saida)],
+            capture_output=True, timeout=120,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if proc.returncode != 0 or not saida.is_file():
+            log.error("Conversão do áudio falhou: %s", proc.stderr.decode("utf-8", "replace")[:300])
+            return None
+        return AudioSegment.from_wav(str(saida))
+
+
+def _trechos_de_fala(audio) -> list:
+    """Divide em trechos de até 35 s, cortando no silêncio mais próximo do fim de cada trecho."""
+    from pydub.silence import detect_silence
+
+    limiar = (audio.dBFS - 16) if audio.dBFS != float("-inf") else -50
+    trechos, inicio, total = [], 0, len(audio)
+    while total - inicio > 300:
+        fim = min(inicio + TRECHO_STT_MS, total)
+        if fim < total:
+            janela = audio[fim - JANELA_CORTE_MS:fim]
+            silencios = detect_silence(janela, min_silence_len=SILENCIO_MIN_MS, silence_thresh=limiar, seek_step=20)
+            if silencios:
+                ini_s, fim_s = silencios[-1]
+                fim = fim - JANELA_CORTE_MS + (ini_s + fim_s) // 2
+        trechos.append(audio[inicio:fim])
+        inicio = fim
+    return trechos
+
+
+def transcrever_audio_garantido(caminho_audio: Optional[str | Path]) -> str:
+    """Transcrição literal, em português, de TUDO o que foi falado no áudio (inclusive > 1 min).
+
+    Converte para WAV PCM 16 kHz mono, divide em trechos de até 35 s (cortando em silêncios)
+    e transcreve cada um com `recognize_google(..., language="pt-BR")`, juntando o texto.
+    Trechos inaudíveis são pulados. Retorna "" se não houver fala reconhecível ou se o
+    serviço estiver fora do ar — nunca levanta exceção (o registro sempre pode ser salvo).
     """
     if not caminho_audio:
         return ""
     caminho = Path(caminho_audio)
-    if not caminho.is_file() or caminho.suffix.lower() not in FORMATOS_STT:
-        log.warning("Transcrição dedicada ignorada (arquivo ausente ou formato %s).", caminho.suffix)
+    if not caminho.is_file():
+        log.warning("Transcrição dedicada ignorada: arquivo de áudio ausente.")
         return ""
     try:
         import speech_recognition as sr
@@ -352,25 +439,38 @@ def transcrever_audio_garantido(caminho_audio: Optional[str | Path]) -> str:
         log.error("Pacote SpeechRecognition não instalado; transcrição dedicada indisponível.")
         return ""
 
+    try:
+        audio = _carregar_audio_pcm(caminho)
+    except Exception as exc:
+        log.error("Falha ao preparar o áudio para transcrição (%s: %s).", type(exc).__name__, exc)
+        audio = None
+    if audio is None or len(audio) < 300:
+        return ""
+
     reconhecedor = sr.Recognizer()
     reconhecedor.operation_timeout = TIMEOUT_STT_SEGUNDOS
     partes: list[str] = []
-    try:
-        with sr.AudioFile(str(caminho)) as fonte:
-            restante = fonte.DURATION or 0
-            while restante > 0.3:
-                trecho = reconhecedor.record(fonte, duration=min(TRECHO_STT_SEGUNDOS, restante))
-                restante -= TRECHO_STT_SEGUNDOS
-                try:
-                    texto = reconhecedor.recognize_google(trecho, language="pt-BR")
-                except sr.UnknownValueError:
-                    continue  # trecho sem fala reconhecível
-                if isinstance(texto, str) and texto.strip():
-                    partes.append(texto.strip())
-    except sr.RequestError as exc:
-        log.error("Serviço de transcrição indisponível (%s).", exc)
-    except Exception as exc:  # arquivo corrompido, timeout etc.
-        log.error("Falha na transcrição dedicada (%s: %s).", type(exc).__name__, exc)
+    trechos = _trechos_de_fala(audio)
+    for i, trecho in enumerate(trechos, start=1):
+        buf = io.BytesIO()
+        trecho.export(buf, format="wav")
+        buf.seek(0)
+        try:
+            with sr.AudioFile(buf) as fonte:
+                dados = reconhecedor.record(fonte)
+            texto = reconhecedor.recognize_google(dados, language="pt-BR")
+        except sr.UnknownValueError:
+            continue  # trecho sem fala reconhecível
+        except sr.RequestError as exc:
+            log.error("Serviço de transcrição indisponível no trecho %d/%d (%s).", i, len(trechos), exc)
+            continue
+        except Exception as exc:  # timeout etc.: segue para o próximo trecho
+            log.error("Falha na transcrição do trecho %d/%d (%s: %s).", i, len(trechos), type(exc).__name__, exc)
+            continue
+        if isinstance(texto, str) and texto.strip():
+            partes.append(texto.strip())
+    log.info("Transcrição dedicada: %d de %d trecho(s) reconhecido(s), %.1f s de áudio.",
+             len(partes), len(trechos), len(audio) / 1000)
     texto = " ".join(partes).strip()
     return texto[:1].upper() + texto[1:] if texto else ""
 
@@ -399,12 +499,25 @@ _SINAIS_PENDENTE = r"\b(?:falta|faltou|precisa|amanh[aã]|vamos|vai\s+ser|penden
 # Fala transcrita vem sem pontuação: além de vírgula/ponto, quebra antes de conectivos
 # ("depois", "amanhã", "também"...) e de "e"/"eu"/"a gente" seguidos de verbo no passado.
 _VERBO_FALA = r"\w+(?:ei|amos|ou|emos|imos|i|aram|eram|iram)\b"
+_COMODO_FALA = (r"(?:banheiro|lavabo|su[ií]te|cozinha|sala|quarto|varanda|garagem|lavanderia|"
+                r"[aá]rea\s+(?:externa|de\s+servi[çc]o)|quintal|jardim|fachada|muro|cal[çc]ada|telhado|laje)")
 _SEPARADORES_FALA = (
     r"[;,.!?]|\s+e\s+(?=(?:(?:eu|a\s+gente|n[oó]s|o\s+\w+)\s+)?" + _VERBO_FALA + ")"
     r"|\s+(?=(?:depois|ent[aã]o|a[ií]|tamb[eé]m|amanh[aã]|em\s+seguida|al[eé]m\s+disso|agora)\b)"
+    # troca de assunto/cômodo: "... de hoje | no banheiro nós retiramos ..."
+    r"|\s+(?=(?:n[oa]s?|sobre\s+[oa])\s+" + _COMODO_FALA + r"\s+(?:(?:eu|n[oó]s|a\s+gente)\s+)?" + _VERBO_FALA + ")"
 )
-_PREFIXOS_FALA = r"^(?:e|ent[aã]o|a[ií]|depois|tamb[eé]m|em\s+seguida|al[eé]m\s+disso|agora|hoje|eu|a\s+gente|n[oó]s|n[eé])\b\s*"
+# Saudações e despedidas do relato falado (não são serviço; "até amanhã" não é pendência).
+_FALAS_SOCIAIS = (
+    r"\b(?:bom\s+dia|boa\s+tarde|boa\s+noite|ol[aá]|oi)\b"
+    r"|\baqui\s+(?:[eé]|est[aá])\s+(?:o\s+)?(?:relato|resumo|[aá]udio)(?:\s+d[ao]\s+(?:obra|dia))?(?:\s+de\s+hoje)?"
+    r"|\b(?:era|[eé]|foi)\s+isso(?:\s+a[ií])?\b|\bat[eé]\s+(?:amanh[aã]|mais|logo|segunda)\b"
+    r"|\b(?:tchau|valeu|obrigad[oa])\b"
+)
+_PREFIXOS_FALA = (r"^(?:e|ent[aã]o|a[ií]|depois|tamb[eé]m|em\s+seguida|al[eé]m\s+disso|agora|hoje|eu|a\s+gente|"
+                  r"n[oó]s|n[eé]|sobre\s+[oa])\b\s*")
 LIMITE_DESCRICAO_TAREFA = 200
+LIMITE_TITULO_TAREFA = 150
 # "vala/poço de infiltração" é serviço (sistema de esgoto), não infiltração de água (problema).
 _SERVICO_INFILTRACAO = r"(?:valas?|po[çc]os?|sistema|campo|caixa)\s+de\s+infiltra\w*"
 # Intenção futura no início da tarefa pendente ("amanhã vamos assentar..." → "Assentar...").
@@ -415,15 +528,12 @@ def _texto_para_atraso(texto: str) -> str:
     return re.sub(_SERVICO_INFILTRACAO, " ", texto, flags=re.IGNORECASE)
 
 
-def _tarefas_por_regras(obs: str, contexto_obra: str = "") -> list[ItemTarefa]:
-    """Quebra a observação em atividades (por vírgula, ';', ' e ') e infere o ambiente.
-
-    O ambiente vem do cômodo citado no trecho; sem cômodo, de um cômodo citado no resto do
-    relato (serviços internos como cerâmica/piso/cano) ou do escopo da obra.
-    """
-    partes = re.split(_SEPARADORES_FALA, obs, flags=re.IGNORECASE)
-    tarefas = []
-    for parte in (p.strip() for p in partes if p):
+def _segmentos_fala(obs: str) -> list[tuple[str, bool]]:
+    """Trechos de atividade do relato: [(texto, concluida)], sem atrasos/paralisações."""
+    segmentos = []
+    obs = re.sub(_FALAS_SOCIAIS, " ", obs, flags=re.IGNORECASE)
+    obs = re.sub(r"\s{2,}", " ", obs)
+    for parte in (p.strip() for p in re.split(_SEPARADORES_FALA, obs, flags=re.IGNORECASE) if p):
         # Vícios de fala no início do trecho ("e aí eu tirei..." → "tirei...").
         while (limpo := re.sub(_PREFIXOS_FALA, "", parte, count=1, flags=re.IGNORECASE).strip()) != parte:
             parte = limpo
@@ -433,17 +543,65 @@ def _tarefas_por_regras(obs: str, contexto_obra: str = "") -> list[ItemTarefa]:
             or any(re.search(padrao, baixa) for padrao, _ in _REGRAS_ATRASO)
             or re.search(_SINAIS_PARALISACAO, baixa)
         ):
-            continue  # ignora fragmentos e frases que são atraso/paralisação, não atividade
+            continue  # fragmentos e frases de atraso/paralisação não são atividade
         concluida = not re.search(_SINAIS_PENDENTE, parte.lower())
         if not concluida:
             parte = re.sub(_PREFIXO_PENDENTE, "", parte, flags=re.IGNORECASE).strip() or parte
-        if len(parte) < 6:
-            continue
+        if len(parte) >= 6:
+            segmentos.append((parte[0].upper() + parte[1:], concluida))
+    return segmentos
+
+
+def _frase(texto: str) -> str:
+    texto = texto.strip()
+    return texto if texto.endswith((".", "!", "?")) else texto + "."
+
+
+def _detalhes_de(texto: str) -> str:
+    """Particularidades técnicas e imprevistos citados num trecho do relato."""
+    alvo = _texto_para_atraso(texto.lower())
+    achados = [d for padrao, d in _REGRAS_DETALHES if re.search(padrao, alvo)]
+    achados += [d for padrao, d in _REGRAS_ATRASO if re.search(padrao, alvo)]
+    return ("; ".join(dict.fromkeys(achados)) + ".") if achados else SEM_PARTICULARIDADES
+
+
+def _tarefas_por_regras(obs: str, contexto_obra: str = "") -> list[ItemTarefa]:
+    """Separa o relato em serviços por ambiente, cada um com resumo e detalhes exclusivos.
+
+    1) quebra a fala em trechos (vírgula, ponto, conectivos como "depois"/"amanhã");
+    2) ambiente de cada trecho: o cômodo citado nele; sem cômodo, o do trecho anterior
+       (continuação do mesmo assunto: "tirei a cerâmica do banheiro e troquei o registro") —
+       exceto serviço interno logo após um ambiente externo; por fim, o relato/escopo;
+    3) agrupa os trechos do mesmo ambiente e status (feito/pendente) numa só tarefa:
+       banheiro/cerâmica/encanamento numa, vala/fossa/anéis/sumidouro em outra.
+    """
+    blocos: dict[tuple[str, bool], dict] = {}
+    anterior: Optional[str] = None
+    for parte, concluida in _segmentos_fala(obs):
+        if ambientes_citados(parte) or anterior is None or (
+            anterior in AMBIENTES_EXTERNOS and eh_servico_interno(parte)
+        ):
+            ambiente = corrigir_ambiente("Geral", parte, obs, contexto_obra)
+        else:
+            ambiente = anterior
+        anterior = ambiente
+        bloco = blocos.setdefault((normalizar_busca(ambiente), concluida),
+                                  {"ambiente": ambiente, "concluida": concluida, "partes": []})
+        bloco["partes"].append(parte)
+
+    tarefas = []
+    for b in blocos.values():
+        titulo = "; ".join(b["partes"])
+        if len(titulo) > LIMITE_TITULO_TAREFA:
+            titulo = titulo[: LIMITE_TITULO_TAREFA - 1].rsplit(" ", 1)[0] + "…"
+        texto = " ".join(_frase(p) for p in b["partes"])
         tarefas.append(
             ItemTarefa(
-                ambiente=corrigir_ambiente("Geral", parte, obs, contexto_obra),
-                descricao=(parte[0].upper() + parte[1:])[:LIMITE_DESCRICAO_TAREFA],
-                concluida=concluida,
+                ambiente=b["ambiente"],
+                descricao=titulo,
+                resumo_servico=texto[:LIMITE_DESCRICAO_TAREFA * 5],
+                detalhes_servico=_detalhes_de(texto),
+                concluida=b["concluida"],
             )
         )
     return tarefas
@@ -484,7 +642,6 @@ def gerar_analise_offline(
         horarios = re.findall(r"\b\d{1,2}\s*(?:h|:\d{2})\s*(?:\d{2})?\b", obs)
         if horarios:
             motivo += f" Horários citados no relato: {', '.join(h.strip() for h in horarios)}."
-        motivo += f" Relato original: “{obs}”."
     else:
         motivo = SEM_ATRASO
 
@@ -498,19 +655,22 @@ def gerar_analise_offline(
         "",
     )
     tarefas = _tarefas_por_regras(obs, contexto_obra)
-    feitas = [f"{t.descricao} ({t.ambiente})" for t in tarefas if t.concluida]
-    pendentes = [f"{t.descricao} ({t.ambiente})" for t in tarefas if not t.concluida]
+    feitas = [f"{t.ambiente}: {t.resumo_servico.rstrip('.')}" for t in tarefas if t.concluida]
+    pendentes = [f"{t.ambiente}: {t.resumo_servico.rstrip('.')}" for t in tarefas if not t.concluida]
     if feitas or pendentes:
         resumo = ""
         if feitas:
-            resumo += "Serviços executados no dia: " + "; ".join(feitas) + "."
+            resumo += "Serviços executados no dia — " + " | ".join(feitas) + "."
         if pendentes:
-            resumo += (" " if resumo else "") + "Serviços previstos/pendentes: " + "; ".join(pendentes) + "."
+            resumo += (" " if resumo else "") + "Previstos/pendentes — " + " | ".join(pendentes) + "."
     elif obs:
-        resumo = f"Registro do dia: {obs[0].upper()}{obs[1:]}"
+        resumo = f"Relato do dia: {obs[0].upper()}{obs[1:]}"
         resumo += "" if resumo.endswith(".") else "."
+    elif tem_audio:
+        resumo = ("Relato do dia gravado em áudio. O resumo será preenchido quando a fala for "
+                  "transcrita (botão 🔄 Transcrever o áudio agora, no Histórico).")
     else:
-        resumo = "Registro do dia efetuado sem descrição textual dos serviços executados."
+        resumo = "Registro fotográfico do dia, sem relato falado ou escrito."
     if escopo and escopo.lower() != "não informado":
         resumo += f" Serviços enquadrados no escopo contratado: {escopo}"
 
@@ -561,6 +721,7 @@ def processar_registro_obra(
     observacoes_texto: str = "",
     contexto_obra: str = "",
     modo_offline: Optional[bool] = None,
+    transcricao_pronta: Optional[str] = None,
 ) -> AnaliseDiarioObra:
     """Analisa áudio + foto + observações de um dia de obra e devolve a análise validada.
 
@@ -579,7 +740,10 @@ def processar_registro_obra(
         raise ValueError("Envie pelo menos um áudio, uma foto ou observações em texto.")
 
     # 1º passo, sempre: o texto real falado no áudio (independe da IA estar disponível).
-    transcricao_literal = transcrever_audio_garantido(audio_path) if audio_path else ""
+    if transcricao_pronta is not None:
+        transcricao_literal = transcricao_pronta.strip()  # já transcrito (ex.: reprocessamento)
+    else:
+        transcricao_literal = transcrever_audio_garantido(audio_path) if audio_path else ""
 
     def offline() -> AnaliseDiarioObra:
         return gerar_analise_offline(observacoes_texto, contexto_obra, audio_path is not None, fotos,

@@ -131,7 +131,7 @@ _REGRAS_AMBIENTE: list[tuple[str, str]] = [
     (r"\bmuros?\b", "Muro"),
     (r"\bcalcada", "Calçada"),
     (r"\btelhado|\blaje\b|\bcobertura\b", "Cobertura"),
-    (r"area\s+externa|\bquintal|\bjardim|\bfossas?\b|\bvalas?\b|sumidouro", "Área Externa"),
+    (r"area\s+externa|\bquintal|\bjardim|\bfossas?\b|\bvalas?\b|sumidouro|\baneis\b|biodigestor", "Área Externa"),
 ]
 AMBIENTES_EXTERNOS = frozenset({"Área Externa", "Muro", "Calçada", "Fachada", "Cobertura", "Garagem"})
 # Ambientes "coringa" que a IA às vezes usa quando não entende o cômodo.
@@ -163,6 +163,11 @@ def ambientes_citados(texto: object) -> list[str]:
             ocupado.append((m.start(), m.end()))
             achados.append((m.start(), nome))
     return list(dict.fromkeys(nome for _, nome in sorted(achados)))
+
+
+def eh_servico_interno(texto: object) -> bool:
+    """True para serviços tipicamente internos (cerâmica, piso, cano, tomada, fiação...)."""
+    return bool(_SERVICO_INTERNO.search(normalizar_busca(texto)))
 
 
 def _mesmo_ambiente(a: str, b: str) -> bool:
@@ -300,6 +305,8 @@ def init_db() -> None:
                 concluida     INTEGER NOT NULL DEFAULT 0 CHECK (concluida IN (0, 1)),
                 data_criacao  TEXT NOT NULL,
                 data_conclusao TEXT,
+                resumo_servico TEXT,
+                detalhes_servico TEXT,
                 FOREIGN KEY (obra_id) REFERENCES clientes_obras (id) ON DELETE CASCADE,
                 FOREIGN KEY (registro_id) REFERENCES registros_diarios (id) ON DELETE SET NULL
             );
@@ -346,12 +353,24 @@ def _migrar(conn: sqlite3.Connection) -> None:
         # Substitui a antiga nota de produtividade (Alta/Média/Baixa) por um texto factual.
         # A coluna legada `nivel_produtividade`, se existir, fica no banco sem uso.
         conn.execute("ALTER TABLE registros_diarios ADD COLUMN detalhes_execucao_imprevistos TEXT")
-    if "data_conclusao" not in {row["name"] for row in conn.execute("PRAGMA table_info(tarefas_obra)")}:
+    colunas_t = {row["name"] for row in conn.execute("PRAGMA table_info(tarefas_obra)")}
+    if "data_conclusao" not in colunas_t:
         # Dia em que a tarefa foi marcada como feita no checklist (NULL: vale a data do registro).
         conn.execute("ALTER TABLE tarefas_obra ADD COLUMN data_conclusao TEXT")
+    # Resumo e detalhes exclusivos da tarefa (um relato pode citar banheiro E vala: cada
+    # tarefa guarda só o que foi dito sobre ela).
+    for coluna in ("resumo_servico", "detalhes_servico"):
+        if coluna not in colunas_t:
+            conn.execute(f"ALTER TABLE tarefas_obra ADD COLUMN {coluna} TEXT")
     _sanear_textos_legados(conn)
     _migrar_fotos_para_midias(conn)
     _corrigir_asbuilt_sem_foto(conn)
+    for (registro_id,) in conn.execute(
+        """SELECT DISTINCT m.registro_id FROM midias_obra m
+           WHERE m.registro_id IS NOT NULL AND m.tarefa_id IS NULL AND m.ambiente = 'Geral'
+             AND EXISTS (SELECT 1 FROM tarefas_obra t WHERE t.registro_id = m.registro_id)"""
+    ).fetchall():
+        _vincular_fotos_soltas(conn, registro_id)
 
 
 def _migrar_fotos_para_midias(conn: sqlite3.Connection) -> int:
@@ -758,6 +777,104 @@ def atualizar_transcricao_registro(registro_id: int, transcricao_audio: str) -> 
         return cur.rowcount > 0
 
 
+def _vincular_fotos_soltas(conn: sqlite3.Connection, registro_id: int) -> int:
+    """Liga as fotos do registro sem tarefa à tarefa certa (mesmo ambiente) ou, se a foto
+    está em "Geral", à tarefa principal do registro (concluída primeiro), levando o ambiente.
+    Fotos sem tarefa em outro ambiente específico ficam como estão. Retorna quantas mudaram."""
+    tarefas = conn.execute(
+        "SELECT id, ambiente, descricao FROM tarefas_obra WHERE registro_id = ? ORDER BY concluida DESC, id",
+        (registro_id,),
+    ).fetchall()
+    if not tarefas:
+        return 0
+    alteradas = 0
+    for m in conn.execute(
+        "SELECT id, ambiente, titulo_servico FROM midias_obra WHERE registro_id = ? AND tarefa_id IS NULL",
+        (registro_id,),
+    ).fetchall():
+        mesma = next((t for t in tarefas if _mesmo_ambiente(t["ambiente"], m["ambiente"])), None)
+        # Só "Geral" é tratado como sem ambiente (uma foto em "Área Externa" não vai para o banheiro).
+        alvo = mesma or (tarefas[0] if normalizar_busca(m["ambiente"]) in ("", "geral", "obra") else None)
+        if alvo is None:
+            continue
+        titulo = m["titulo_servico"]
+        if not titulo or titulo == "Registro fotográfico do dia":
+            titulo = alvo["descricao"][:120]
+        conn.execute(
+            "UPDATE midias_obra SET tarefa_id = ?, ambiente = ?, titulo_servico = ? WHERE id = ?",
+            (alvo["id"], alvo["ambiente"] if mesma is None else m["ambiente"], titulo, m["id"]),
+        )
+        alteradas += 1
+    return alteradas
+
+
+def vincular_fotos_soltas_do_registro(registro_id: int) -> int:
+    with get_connection() as conn:
+        return _vincular_fotos_soltas(conn, registro_id)
+
+
+def aplicar_reprocessamento_registro(
+    registro_id: int,
+    transcricao_audio: str,
+    resumo_executivo: str,
+    detalhes_execucao_imprevistos: str,
+    motivo_atraso: str,
+    tarefas: list[dict],
+    mapeamento_asbuilt: Optional[str] = None,
+) -> dict:
+    """Grava a nova análise de um registro já salvo (ex.: áudio transcrito de novo).
+
+    Atualiza os textos do dia e faz "upsert" das tarefas por ambiente: a tarefa do registro
+    no mesmo ambiente é atualizada (título, resumo e detalhes; o status marcado à mão é
+    mantido); ambientes novos viram tarefas novas. Tarefas antigas sem correspondente ficam.
+    Por fim, liga as fotos soltas do registro às tarefas. Retorna contagens.
+    """
+    with get_connection() as conn:
+        reg = conn.execute("SELECT obra_id, mapeamento_asbuilt FROM registros_diarios WHERE id = ?",
+                           (registro_id,)).fetchone()
+        if reg is None:
+            raise ValueError(f"Registro inexistente: {registro_id}")
+        asbuilt = reg["mapeamento_asbuilt"]
+        if mapeamento_asbuilt and (not (asbuilt or "").strip() or (asbuilt or "").strip() == SEM_FOTO_ASBUILT):
+            asbuilt = mapeamento_asbuilt
+        conn.execute(
+            """UPDATE registros_diarios SET transcricao_audio = ?, resumo_executivo = ?,
+                      detalhes_execucao_imprevistos = ?, motivo_atraso = ?, mapeamento_asbuilt = ?
+               WHERE id = ?""",
+            (transcricao_audio, resumo_executivo, detalhes_execucao_imprevistos, motivo_atraso, asbuilt, registro_id),
+        )
+        existentes = conn.execute("SELECT id, ambiente FROM tarefas_obra WHERE registro_id = ? ORDER BY id",
+                                  (registro_id,)).fetchall()
+        usados: set[int] = set()
+        criadas = atualizadas = 0
+        for t in tarefas:
+            desc = (t.get("descricao") or "").strip()
+            if not desc:
+                continue
+            ambiente = _normalizar_ambiente(t.get("ambiente"))
+            alvo = next((e for e in existentes if e["id"] not in usados
+                         and normalizar_busca(e["ambiente"]) == normalizar_busca(ambiente)), None)
+            if alvo:
+                usados.add(alvo["id"])
+                conn.execute(
+                    "UPDATE tarefas_obra SET descricao = ?, resumo_servico = ?, detalhes_servico = ? WHERE id = ?",
+                    (desc, t.get("resumo_servico") or "", t.get("detalhes_servico") or "", alvo["id"]),
+                )
+                atualizadas += 1
+            else:
+                conn.execute(
+                    """INSERT INTO tarefas_obra (obra_id, registro_id, ambiente, descricao, concluida, data_criacao,
+                                                 resumo_servico, detalhes_servico)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (reg["obra_id"], registro_id, ambiente, desc, 1 if t.get("concluida") else 0,
+                     datetime.now().isoformat(timespec="seconds"),
+                     t.get("resumo_servico") or "", t.get("detalhes_servico") or ""),
+                )
+                criadas += 1
+        fotos = _vincular_fotos_soltas(conn, registro_id)
+    return {"criadas": criadas, "atualizadas": atualizadas, "fotos_vinculadas": fotos}
+
+
 def excluir_registro_diario(registro_id: int, excluir_tarefas: bool = False, excluir_fotos: bool = False) -> bool:
     """Exclui um registro diário e apaga com segurança suas mídias órfãs em uploads\\.
 
@@ -802,15 +919,21 @@ def inserir_tarefa(
     ambiente: str,
     descricao: str,
     concluida: int | bool = 1,
+    resumo_servico: str = "",
+    detalhes_servico: str = "",
 ) -> int:
-    """Insere uma tarefa no checklist da obra e retorna o seu id."""
+    """Insere uma tarefa no checklist da obra e retorna o seu id.
+
+    `resumo_servico`/`detalhes_servico`: o que foi dito no relato SÓ sobre este serviço.
+    """
     if not descricao or not descricao.strip():
         raise ValueError("A descrição da tarefa é obrigatória.")
     with get_connection() as conn:
         cur = conn.execute(
             """
-            INSERT INTO tarefas_obra (obra_id, registro_id, ambiente, descricao, concluida, data_criacao)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO tarefas_obra (obra_id, registro_id, ambiente, descricao, concluida, data_criacao,
+                                      resumo_servico, detalhes_servico)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 obra_id,
@@ -819,6 +942,8 @@ def inserir_tarefa(
                 descricao.strip(),
                 1 if concluida else 0,
                 datetime.now().isoformat(timespec="seconds"),
+                (resumo_servico or "").strip(),
+                (detalhes_servico or "").strip(),
             ),
         )
         return int(cur.lastrowid)
@@ -850,7 +975,7 @@ def buscar_tarefas(
     where, params = ["t.obra_id = ?"], [obra_id]
     # Cada palavra pode estar na tarefa, no relato do dia que a originou (transcrição/resumo)
     # ou no título do serviço das fotos vinculadas a ela.
-    campos_busca = ("t.descricao", "t.ambiente", "r.transcricao_audio", "r.resumo_executivo")
+    campos_busca = ("t.descricao", "t.ambiente", "t.resumo_servico", "r.transcricao_audio", "r.resumo_executivo")
     for termo in _termos(busca):
         campos = " OR ".join(f"norm({c}) LIKE ? ESCAPE '\\'" for c in campos_busca)
         where.append(
@@ -879,7 +1004,8 @@ def buscar_tarefas(
     with get_connection() as conn:
         rows = conn.execute(
             f"""
-            SELECT t.id, t.obra_id, t.registro_id, t.ambiente, t.descricao, t.concluida, t.data_criacao
+            SELECT t.id, t.obra_id, t.registro_id, t.ambiente, t.descricao, t.concluida, t.data_criacao,
+                   t.resumo_servico, t.detalhes_servico
             FROM tarefas_obra t
             LEFT JOIN registros_diarios r ON r.id = t.registro_id
             WHERE {' AND '.join(where)}
@@ -945,8 +1071,8 @@ def buscar_dossie_tarefas(
         ambientes = list(ambiente_filtro or [])
 
     where, params = [], []
-    textos = ("b.descricao", "b.ambiente", "r.transcricao_audio", "r.resumo_executivo",
-              "r.motivo_atraso", "r.detalhes_execucao_imprevistos")
+    textos = ("b.descricao", "b.ambiente", "b.resumo_servico", "b.detalhes_servico", "r.transcricao_audio",
+              "r.resumo_executivo", "r.motivo_atraso", "r.detalhes_execucao_imprevistos")
     for termo in _termos(termo_busca):
         campos = " OR ".join(f"norm({c}) LIKE ? ESCAPE '\\'" for c in textos)
         where.append(
@@ -977,7 +1103,7 @@ def buscar_dossie_tarefas(
     sql = f"""
         WITH b AS (
             SELECT t.id, t.obra_id, t.registro_id, t.ambiente, t.descricao, t.concluida, t.data_criacao,
-                   t.data_conclusao,
+                   t.data_conclusao, t.resumo_servico, t.detalhes_servico,
                    COALESCE(t.registro_id, (
                        SELECT r2.id FROM registros_diarios r2
                        WHERE r2.obra_id = t.obra_id AND r2.data_registro = substr(t.data_criacao, 1, 10)
@@ -1004,6 +1130,7 @@ def buscar_dossie_tarefas(
             item = dossie[row["id"]] = {
                 "id": row["id"], "obra_id": row["obra_id"], "registro_id": row["registro_id"],
                 "ambiente": row["ambiente"], "descricao": row["descricao"], "concluida": row["concluida"],
+                "resumo_servico": row["resumo_servico"] or "", "detalhes_servico": row["detalhes_servico"] or "",
                 "data_criacao": row["data_criacao"], "data_registro_origem": row["data_tarefa"],
                 # Concluída: o dia em que foi marcada como feita ou, se já nasceu feita, o do registro.
                 "data_execucao": (row["data_conclusao"] or row["data_tarefa"]) if row["concluida"] else None,
@@ -1021,7 +1148,7 @@ def buscar_dossie_tarefas(
         # se alguma tarefa corresponde pelo próprio texto/fotos, só elas entram.
         diretos = [
             d for d in resultado
-            if corresponde_busca(termo_busca, d["descricao"], d["ambiente"],
+            if corresponde_busca(termo_busca, d["descricao"], d["ambiente"], d["resumo_servico"], d["detalhes_servico"],
                                  *(f"{f['titulo_servico'] or ''} {f['descricao_tecnica'] or ''}" for f in d["fotos"]))
         ]
         if diretos:
@@ -1069,7 +1196,8 @@ def alternar_status_tarefa(tarefa_id: int, concluida: int | bool, data_conclusao
         return cur.rowcount > 0
 
 
-def editar_tarefa(tarefa_id: int, ambiente: str, descricao: str) -> bool:
+def editar_tarefa(tarefa_id: int, ambiente: str, descricao: str,
+                  resumo_servico: Optional[str] = None, detalhes_servico: Optional[str] = None) -> bool:
     """Altera ambiente e descrição de uma tarefa. False se não existir.
 
     As fotos vinculadas à tarefa que estavam no ambiente antigo acompanham a mudança
@@ -1083,8 +1211,9 @@ def editar_tarefa(tarefa_id: int, ambiente: str, descricao: str) -> bool:
         if antigo is None:
             return False
         conn.execute(
-            "UPDATE tarefas_obra SET ambiente = ?, descricao = ? WHERE id = ?",
-            (novo, descricao.strip(), tarefa_id),
+            "UPDATE tarefas_obra SET ambiente = ?, descricao = ?, resumo_servico = COALESCE(?, resumo_servico), "
+            "detalhes_servico = COALESCE(?, detalhes_servico) WHERE id = ?",
+            (novo, descricao.strip(), resumo_servico, detalhes_servico, tarefa_id),
         )
         conn.execute(
             "UPDATE midias_obra SET ambiente = ? WHERE tarefa_id = ? AND ambiente = ?",

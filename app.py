@@ -14,7 +14,6 @@ from functools import partial
 from pathlib import Path
 
 import streamlit as st
-import streamlit.components.v1 as components
 from PIL import Image
 
 import database as db
@@ -151,8 +150,8 @@ footer {visibility: hidden;}
 [data-testid="stCheckbox"] label > span:first-child {transform: scale(1.3); margin-right: .7rem;}
 .stTabs [data-baseweb="tab"] {min-height: 3rem; padding: 0 .9rem;}
 [data-testid="stSegmentedControl"] button {min-height: 2.75rem;}
-/* Iframe invisível que aplica o bloqueio de tradução (não ocupa espaço). */
-.stElementContainer:has(> iframe[height="0"]), [data-testid="stElementContainer"]:has(iframe[height="0"]) {display: none;}
+/* Elemento invisível que aplica o bloqueio de tradução (não ocupa espaço). */
+[data-testid="stElementContainer"]:has(.ot-bloqueio-traducao) {display: none;}
 .ot-transcricao {border-left: 4px solid #3b82f6; background: rgba(59, 130, 246, .08); border-radius: 8px;
   padding: .55rem .8rem; margin: .3rem 0 .6rem; font-size: .95rem; line-height: 1.45;}
 </style>
@@ -163,12 +162,12 @@ footer {visibility: hidden;}
 
 # O tradutor automático do Chrome reescreve os textos da página ("anéis" → "animais") e
 # troca nós do DOM que o React do Streamlit controla, o que derruba a tela com
-# "NotFoundError: Failed to execute 'removeChild' on 'Node'". O script abaixo roda num
-# iframe invisível (mesma origem) e marca a página inteira como pt-BR e "não traduzir".
-_BLOQUEIO_TRADUCAO = """<script>
+# "NotFoundError: Failed to execute 'removeChild' on 'Node'". O script abaixo (st.html com
+# JavaScript, na própria página) marca a página inteira como pt-BR e "não traduzir".
+_BLOQUEIO_TRADUCAO = """<span class="ot-bloqueio-traducao"></span><script>
 (function () {
   try {
-    var d = window.parent.document, alvos = [d.documentElement, d.body];
+    var d = document, alvos = [d.documentElement, d.body];
     alvos.forEach(function (el) {
       if (!el) return;
       el.setAttribute("translate", "no");
@@ -183,7 +182,7 @@ _BLOQUEIO_TRADUCAO = """<script>
   } catch (e) {}
 })();
 </script>"""
-components.html(_BLOQUEIO_TRADUCAO, height=0)
+st.html(_BLOQUEIO_TRADUCAO, unsafe_allow_javascript=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -752,9 +751,12 @@ def bloco_transcricao(texto: str | None, tem_audio: bool, registro_id: int | Non
     elif tem_audio:
         st.caption("🎙️ A transcrição deste áudio ainda não está disponível.")
         if registro_id is not None and caminho_audio:
-            st.button("🔄 Transcrever o áudio agora", key=f"retranscrever_{chave}_{registro_id}",
-                      on_click=_retranscrever_cb, args=(registro_id, caminho_audio),
-                      help="Converte a fala do áudio gravado em texto e grava no registro.")
+            if st.button("🔄 Transcrever o áudio agora", key=f"retranscrever_{chave}_{registro_id}",
+                         help="Converte a fala do áudio em texto e, a partir dela, refaz o resumo do dia e as "
+                         "tarefas separadas por ambiente (o status marcado no checklist é mantido)."):
+                with st.spinner("Transcrevendo o áudio e separando os serviços por ambiente..."):
+                    reprocessar_registro(registro_id)
+                st.rerun()
 
 
 def asbuilt_exibivel(texto: str | None, tem_foto: bool) -> str:
@@ -1001,13 +1003,39 @@ def _excluir_obra_cb(obra_id: int, nome: str) -> None:
     flash(f"Bloco “{nome}” excluído.")
 
 
-def _retranscrever_cb(registro_id: int, caminho_audio: str) -> None:
-    texto = transcrever_audio_garantido(resolver_caminho(caminho_audio))
-    if texto:
-        db.atualizar_transcricao_registro(registro_id, sanitize_text(texto, LIMITE_TEXTO_LONGO))
-        flash("Áudio transcrito e gravado no registro.")
-    else:
+def reprocessar_registro(registro_id: int) -> None:
+    """Transcreve de novo o áudio de um registro salvo e refaz resumo, detalhes e tarefas por ambiente."""
+    r = next((x for x in db.listar_registros_por_obra(obra_id) if x["id"] == registro_id), None)
+    audio = resolver_caminho(r.get("caminho_audio")) if r else None
+    texto = transcrever_audio_garantido(audio) if audio else ""
+    if not texto:
         flash("Não foi possível reconhecer a fala neste áudio agora. Tente novamente mais tarde.")
+        return
+    fotos_r = midias_com_arquivo(db.listar_midias_obra(obra_id, registro_id=registro_id))
+    try:
+        analise = processar_registro_obra(caminho_audio=audio, caminho_foto=[f for _, f in fotos_r],
+                                          contexto_obra=contexto_da_obra(obra), transcricao_pronta=texto)
+    except Exception:
+        logging.getLogger("obratrack.app").exception("Erro inesperado no reprocessamento")
+        analise = gerar_analise_offline("", contexto_da_obra(obra), True, [f for _, f in fotos_r], transcricao=texto)
+    longo = partial(sanitize_text, max_length=LIMITE_TEXTO_LONGO)
+    # Fotos que estavam em "Geral": usa a classificação da IA (ambiente/serviço de cada foto).
+    for cls in analise.fotos_classificadas:
+        m = fotos_r[cls.indice_foto - 1][0]
+        if db.normalizar_busca(m["ambiente"]) in ("", "geral"):
+            db.editar_midia_obra(m["id"], sanitize_text(cls.ambiente, LIM_AMBIENTE) or "Geral",
+                                 sanitize_text(cls.titulo_servico, LIM_TAREFA) or m.get("titulo_servico") or "",
+                                 m.get("descricao_tecnica") or longo(cls.descricao_tecnica))
+    res = db.aplicar_reprocessamento_registro(
+        registro_id, longo(analise.transcricao_audio), longo(analise.resumo_executivo),
+        longo(analise.detalhes_execucao_imprevistos), longo(analise.motivo_atraso) or SEM_ATRASO,
+        [{"ambiente": sanitize_text(t.ambiente, LIM_AMBIENTE) or "Geral", "descricao": sanitize_text(t.descricao, LIM_TAREFA),
+          "resumo_servico": longo(t.resumo_servico), "detalhes_servico": longo(t.detalhes_servico),
+          "concluida": t.concluida} for t in analise.tarefas_extraidas],
+        mapeamento_asbuilt=longo(analise.mapeamento_asbuilt),
+    )
+    flash(f"Áudio transcrito: {res['criadas']} tarefa(s) nova(s), {res['atualizadas']} atualizada(s) e "
+          f"{res['fotos_vinculadas']} foto(s) vinculada(s) ao serviço.")
 
 
 def _excluir_midia_cb(midia_id: int) -> None:
@@ -1362,7 +1390,9 @@ with aba_registro:
                 desc = sanitize_text(t.descricao, LIM_TAREFA)
                 if desc:
                     amb = sanitize_text(t.ambiente, LIM_AMBIENTE) or "Geral"
-                    tid = db.inserir_tarefa(obra_id, novo_id, amb, desc, int(t.concluida))
+                    tid = db.inserir_tarefa(obra_id, novo_id, amb, desc, int(t.concluida),
+                                            resumo_servico=sanitize_text(t.resumo_servico, LIMITE_TEXTO_LONGO),
+                                            detalhes_servico=sanitize_text(t.detalhes_servico, LIMITE_TEXTO_LONGO))
                     tarefas_novas.append({"id": tid, "ambiente": amb, "descricao": desc, "concluida": int(t.concluida)})
 
             vincular_fotos_do_registro(obra, novo_id, data_reg.isoformat(), analise, dados, obs,
@@ -1439,22 +1469,37 @@ def conteudo_dossie(d: dict, prefixo: str) -> None:
         data_txt = f"📅 Registrada em: {formatar_data(d['data_registro_origem'])} · ainda não executada"
     st.markdown(f"<span class='ot-data'>{esc(data_txt)}</span>", unsafe_allow_html=True)
 
-    st.markdown("<div class='ot-dossie-bloco'>🗒️ Contexto do dia</div>", unsafe_allow_html=True)
+    # Resumo/detalhes EXCLUSIVOS desta tarefa: num relato que fala do banheiro e da vala,
+    # o card do banheiro nunca mostra o texto da vala.
+    st.markdown("<div class='ot-dossie-bloco'>🗒️ O que foi feito neste serviço</div>", unsafe_allow_html=True)
+    resumo_t, detalhes_t = d.get("resumo_servico") or "", d.get("detalhes_servico") or ""
+    if not resumo_t and reg and len(mapa_tarefas.get(reg["id"], [])) <= 1:
+        # Tarefa antiga sem resumo próprio, mas o relato do dia só tratou dela: sem mistura.
+        resumo_t = reg.get("resumo_executivo") or ""
+        detalhes_t = detalhes_t or reg.get("detalhes_execucao_imprevistos") or ""
+    if resumo_t:
+        st.markdown(f"**Resumo do serviço:** {resumo_t}")
+    elif reg:
+        st.caption("O relato deste dia cita vários serviços e esta tarefa ainda não tem resumo próprio. "
+                   "Veja o relato completo abaixo.")
+    if tem_detalhes(detalhes_t):
+        st.info(f"**🔧 Detalhes de execução deste serviço:** {detalhes_t}")
     if reg is None:
         st.caption("Tarefa adicionada manualmente, sem registro diário (relato) vinculado.")
     else:
         if reg["data_registro"] != d.get("data_execucao"):
             st.caption(f"Relato do dia {formatar_data(reg['data_registro'])}")
-        st.markdown(f"**Resumo do dia:** {reg.get('resumo_executivo') or '-'}")
-        if tem_detalhes(reg.get("detalhes_execucao_imprevistos")):
-            st.info(f"**🔧 Detalhes de execução / imprevistos:** {reg['detalhes_execucao_imprevistos']}")
         if tem_atraso(reg.get("motivo_atraso")):
-            st.warning(f"**Justificativa de atraso:** {reg['motivo_atraso']}", icon="⚠️")
+            st.warning(f"**Atraso registrado no dia:** {reg['motivo_atraso']}", icon="⚠️")
         audio_d = resolver_caminho(reg.get("caminho_audio"))
         if audio_d:
-            st.caption("🎙️ Relato original do canteiro")
+            st.caption("🎙️ Relato original do canteiro (áudio do dia inteiro)")
             tocar_audio(audio_d)
-        bloco_transcricao(reg.get("transcricao_audio"), audio_d is not None)
+        if falado := transcricao_real(reg.get("transcricao_audio")):
+            with st.expander("📝 Relato completo do dia (todos os serviços falados)", key=f"{prefixo}_relato"):
+                st.write(falado)
+        elif audio_d:
+            st.caption("🎙️ A transcrição deste áudio ainda não está disponível (use 🔄 no Histórico).")
 
     fotos_d = midias_com_arquivo([
         {**f, "obra_id": d["obra_id"], "tarefa_descricao": d["descricao"], "tarefa_concluida": d["concluida"],
@@ -1528,10 +1573,18 @@ def linha_tarefa(t: dict) -> None:
                 e_amb = seletor_ambiente("Ambiente", recomendados, atual=t["ambiente"], key=f"edit_tarefa_amb_{t['id']}")
                 e_desc = st.text_input("Descrição", value=t["descricao"], max_chars=LIM_TAREFA, help="Texto da tarefa.",
                                        key=f"edit_tarefa_desc_{t['id']}")
+                e_resumo = st.text_area("Resumo do serviço", value=t.get("resumo_servico") or "",
+                                        max_chars=LIMITE_TEXTO_LONGO, key=f"edit_tarefa_resumo_{t['id']}",
+                                        help="O que foi feito SÓ neste serviço/ambiente.")
+                e_det = st.text_area("Detalhes de execução do serviço", value=t.get("detalhes_servico") or "",
+                                     max_chars=LIMITE_TEXTO_LONGO, key=f"edit_tarefa_det_{t['id']}",
+                                     help="Materiais, medidas e particularidades deste serviço.")
                 st.caption("As fotos desta tarefa acompanham a troca de ambiente.")
                 if st.form_submit_button("💾 Salvar", type="primary", width="stretch", key=f"edit_tarefa_salvar_{t['id']}"):
                     if desc_ok := sanitize_text(e_desc, LIM_TAREFA):
-                        db.editar_tarefa(t["id"], sanitize_text(e_amb, LIM_AMBIENTE), desc_ok)
+                        db.editar_tarefa(t["id"], sanitize_text(e_amb, LIM_AMBIENTE), desc_ok,
+                                         resumo_servico=sanitize_text(e_resumo, LIMITE_TEXTO_LONGO),
+                                         detalhes_servico=sanitize_text(e_det, LIMITE_TEXTO_LONGO))
                         flash("Tarefa atualizada.")
                         st.rerun()
                     else:

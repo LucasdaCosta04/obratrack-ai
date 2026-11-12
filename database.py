@@ -18,7 +18,6 @@ UPLOADS_DIR = BASE_DIR / "uploads"
 GITIGNORE_PATH = BASE_DIR / ".gitignore"
 
 STATUS_OBRA = ("Em Andamento", "Pausada", "Concluída")
-NIVEIS_PRODUTIVIDADE = ("Baixa", "Média", "Alta")
 
 AMBIENTES_BASE = (
     "Banheiro Social", "Banheiro Suíte", "Cozinha", "Sala", "Quarto",
@@ -278,9 +277,8 @@ def init_db() -> None:
                 data_registro        TEXT NOT NULL,
                 transcricao_audio    TEXT,
                 resumo_executivo     TEXT,
-                nivel_produtividade  TEXT
-                                     CHECK (nivel_produtividade IN ('Baixa', 'Média', 'Alta')),
                 motivo_atraso        TEXT,
+                detalhes_execucao_imprevistos TEXT,
                 mapeamento_asbuilt   TEXT,
                 caminho_foto         TEXT,
                 caminho_audio        TEXT,
@@ -301,6 +299,7 @@ def init_db() -> None:
                 descricao     TEXT NOT NULL,
                 concluida     INTEGER NOT NULL DEFAULT 0 CHECK (concluida IN (0, 1)),
                 data_criacao  TEXT NOT NULL,
+                data_conclusao TEXT,
                 FOREIGN KEY (obra_id) REFERENCES clientes_obras (id) ON DELETE CASCADE,
                 FOREIGN KEY (registro_id) REFERENCES registros_diarios (id) ON DELETE SET NULL
             );
@@ -343,6 +342,13 @@ def _migrar(conn: sqlite3.Connection) -> None:
     if "foto_bytes_original" not in colunas:
         # Tamanho da foto como saiu do celular, para mostrar a economia da compressão.
         conn.execute("ALTER TABLE registros_diarios ADD COLUMN foto_bytes_original INTEGER")
+    if "detalhes_execucao_imprevistos" not in colunas:
+        # Substitui a antiga nota de produtividade (Alta/Média/Baixa) por um texto factual.
+        # A coluna legada `nivel_produtividade`, se existir, fica no banco sem uso.
+        conn.execute("ALTER TABLE registros_diarios ADD COLUMN detalhes_execucao_imprevistos TEXT")
+    if "data_conclusao" not in {row["name"] for row in conn.execute("PRAGMA table_info(tarefas_obra)")}:
+        # Dia em que a tarefa foi marcada como feita no checklist (NULL: vale a data do registro).
+        conn.execute("ALTER TABLE tarefas_obra ADD COLUMN data_conclusao TEXT")
     _sanear_textos_legados(conn)
     _migrar_fotos_para_midias(conn)
 
@@ -428,11 +434,6 @@ def _sanear_textos_legados(conn: sqlite3.Connection) -> None:
 def _validar_status(status: str) -> None:
     if status not in STATUS_OBRA:
         raise ValueError(f"Status inválido: {status!r}. Use um de {STATUS_OBRA}.")
-
-
-def _validar_nivel(nivel: Optional[str]) -> None:
-    if nivel is not None and nivel not in NIVEIS_PRODUTIVIDADE:
-        raise ValueError(f"Nível de produtividade inválido: {nivel!r}. Use um de {NIVEIS_PRODUTIVIDADE}.")
 
 
 def _remover_midias_orfas(conn: sqlite3.Connection, caminhos: list[Optional[str]]) -> int:
@@ -564,8 +565,8 @@ def inserir_registro(
     obra_id: int,
     transcricao_audio: str = "",
     resumo_executivo: str = "",
-    nivel_produtividade: Optional[str] = None,
     motivo_atraso: str = "",
+    detalhes_execucao_imprevistos: str = "",
     mapeamento_asbuilt: str = "",
     caminho_foto: Optional[str | Path] = None,
     caminho_audio: Optional[str | Path] = None,
@@ -573,7 +574,6 @@ def inserir_registro(
     foto_bytes_original: Optional[int] = None,
 ) -> int:
     """Insere um registro diário vinculado a uma obra e retorna o seu id."""
-    _validar_nivel(nivel_produtividade)
     data_registro = data_registro or date.today().isoformat()
     # Só aceita mídias dentro de uploads\ (impede gravar caminhos para arquivos arbitrários do disco).
     for rotulo, caminho in (("foto", caminho_foto), ("áudio", caminho_audio)):
@@ -586,7 +586,7 @@ def inserir_registro(
             """
             INSERT INTO registros_diarios (
                 obra_id, data_registro, transcricao_audio, resumo_executivo,
-                nivel_produtividade, motivo_atraso, mapeamento_asbuilt,
+                motivo_atraso, detalhes_execucao_imprevistos, mapeamento_asbuilt,
                 caminho_foto, caminho_audio, foto_bytes_original
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -595,8 +595,8 @@ def inserir_registro(
                 data_registro,
                 transcricao_audio,
                 resumo_executivo,
-                nivel_produtividade,
                 motivo_atraso,
+                detalhes_execucao_imprevistos,
                 mapeamento_asbuilt,
                 foto,
                 audio,
@@ -607,7 +607,7 @@ def inserir_registro(
 
 
 _COLUNAS_REGISTRO = """r.id, r.obra_id, r.data_registro, r.transcricao_audio, r.resumo_executivo,
-                   r.nivel_produtividade, r.motivo_atraso, r.mapeamento_asbuilt,
+                   r.motivo_atraso, r.detalhes_execucao_imprevistos, r.mapeamento_asbuilt,
                    r.caminho_foto, r.caminho_audio, r.foto_bytes_original"""
 
 
@@ -635,7 +635,6 @@ def buscar_registros(
     obra_id: int,
     busca: str = "",
     ambientes: Optional[list[str]] = None,
-    niveis: Optional[list[str]] = None,
     data_inicio: Optional[str] = None,
     data_fim: Optional[str] = None,
     apenas_atraso: bool = False,
@@ -649,7 +648,8 @@ def buscar_registros(
     - `apenas_atraso`: só dias com justificativa de atraso diferente de `texto_sem_atraso`.
     """
     where, params = ["r.obra_id = ?"], [obra_id]
-    textos = ("r.transcricao_audio", "r.resumo_executivo", "r.motivo_atraso", "r.mapeamento_asbuilt")
+    textos = ("r.transcricao_audio", "r.resumo_executivo", "r.motivo_atraso",
+              "r.detalhes_execucao_imprevistos", "r.mapeamento_asbuilt")
     for termo in _termos(busca):
         campos = " OR ".join(f"norm({c}) LIKE ? ESCAPE '\\'" for c in textos)
         where.append(
@@ -674,9 +674,6 @@ def buscar_registros(
         params += list(ambientes)
         for a in ambientes:
             params += [_like(a)] * 2
-    if niveis:
-        where.append(f"r.nivel_produtividade IN ({', '.join('?' * len(niveis))})")
-        params += list(niveis)
     if data_inicio:
         where.append("r.data_registro >= ?")
         params.append(data_inicio)
@@ -701,26 +698,25 @@ def atualizar_registro_diario(
     data_registro: str,
     transcricao_audio: str,
     resumo_executivo: str,
-    nivel_produtividade: str,
     motivo_atraso: str,
+    detalhes_execucao_imprevistos: str,
     mapeamento_asbuilt: str,
 ) -> bool:
     """Atualiza os campos textuais de um registro (mídias não mudam). False se não existir."""
-    _validar_nivel(nivel_produtividade)
     with get_connection() as conn:
         cur = conn.execute(
             """
             UPDATE registros_diarios
             SET data_registro = ?, transcricao_audio = ?, resumo_executivo = ?,
-                nivel_produtividade = ?, motivo_atraso = ?, mapeamento_asbuilt = ?
+                motivo_atraso = ?, detalhes_execucao_imprevistos = ?, mapeamento_asbuilt = ?
             WHERE id = ?
             """,
             (
                 data_registro,
                 transcricao_audio,
                 resumo_executivo,
-                nivel_produtividade,
                 motivo_atraso,
+                detalhes_execucao_imprevistos,
                 mapeamento_asbuilt,
                 registro_id,
             ),
@@ -804,7 +800,6 @@ def buscar_tarefas(
     busca: str = "",
     ambientes: Optional[list[str]] = None,
     status: str = "Todas",
-    niveis: Optional[list[str]] = None,
     data_inicio: Optional[str] = None,
     data_fim: Optional[str] = None,
     apenas_atraso: bool = False,
@@ -813,8 +808,8 @@ def buscar_tarefas(
     """Tarefas da obra que atendem a todos os filtros (por ambiente; pendentes primeiro).
 
     A data de uma tarefa é a do registro de origem ou, se foi digitada à mão, a de criação.
-    Filtros de produtividade e atraso pertencem ao registro: com eles ativos, só entram
-    tarefas extraídas de registros que os atendem.
+    O filtro de atraso pertence ao registro: com ele ativo, só entram tarefas extraídas
+    de registros que o atendem.
     """
     if status not in STATUS_TAREFA:
         raise ValueError(f"Status de tarefa inválido: {status!r}. Use um de {STATUS_TAREFA}.")
@@ -843,9 +838,6 @@ def buscar_tarefas(
     if data_fim:
         where.append(f"{data_tarefa} <= ?")
         params.append(data_fim)
-    if niveis:
-        where.append(f"r.nivel_produtividade IN ({', '.join('?' * len(niveis))})")
-        params += list(niveis)
     if apenas_atraso:
         sql, p = _filtro_atraso(texto_sem_atraso)
         where.append(f"r.id IS NOT NULL AND {sql}")
@@ -862,6 +854,145 @@ def buscar_tarefas(
             params,
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+_COLUNAS_DOSSIE_REGISTRO = (
+    "data_registro", "transcricao_audio", "resumo_executivo", "motivo_atraso",
+    "detalhes_execucao_imprevistos", "mapeamento_asbuilt", "caminho_audio",
+)
+_COLUNAS_DOSSIE_MIDIA = (
+    "id", "registro_id", "tarefa_id", "ambiente", "titulo_servico", "descricao_tecnica",
+    "caminho_foto", "data_midia", "foto_bytes_original",
+)
+
+
+def _cond_midia_da_tarefa(m: str) -> str:
+    """Fotos que documentam a tarefa `b`: vinculadas a ela ou, se soltas (sem tarefa), do
+    mesmo ambiente e do mesmo registro/dia. Fotos de OUTRA tarefa nunca entram."""
+    return (
+        f"{m}.obra_id = b.obra_id AND ({m}.tarefa_id = b.id OR ({m}.tarefa_id IS NULL "
+        f"AND {m}.ambiente = b.ambiente AND ({m}.registro_id = b.reg_id OR {m}.data_midia = b.data_tarefa)))"
+    )
+
+
+def buscar_dossie_tarefas(
+    obra_id: int,
+    termo_busca: str = "",
+    ambiente_filtro: str | list[str] | None = "Todos",
+    status_filtro: str = "Todos",
+    data_inicio: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    apenas_atraso: bool = False,
+    texto_sem_atraso: str = "",
+    priorizar_diretos: bool = True,
+) -> list[dict]:
+    """Dossiê completo de cada tarefa: a tarefa, o registro diário do dia e as fotos do serviço.
+
+    - Registro: o de origem (`registro_id`) ou, para tarefas digitadas à mão, o registro da
+      mesma obra na data de criação da tarefa (LEFT JOIN: pode não haver).
+    - Fotos (LEFT JOIN): as vinculadas à tarefa e as soltas do mesmo ambiente e registro/dia.
+    - `termo_busca`: cada palavra precisa aparecer na tarefa, no relato/resumo/detalhes/atraso
+      do dia ou no título/descrição de alguma foto do dossiê (sem acentos/maiúsculas). Com
+      `priorizar_diretos`, se alguma tarefa corresponde pelo próprio texto/fotos, as que só
+      batem pelo relato do dia ficam de fora.
+    - `ambiente_filtro`: "Todos", um ambiente ou uma lista; `status_filtro`: "Todos"/"Todas",
+      "Pendentes" ou "Concluídas".
+
+    Retorna dicts com os campos da tarefa, `data_registro_origem` (dia do relato ou da
+    criação), `data_execucao` (só concluídas), `registro` (dict ou None) e `fotos` (lista),
+    do dia mais recente para o mais antigo.
+    """
+    status = "Todas" if status_filtro in (None, "", "Todos") else status_filtro
+    if status not in STATUS_TAREFA:
+        raise ValueError(f"Status de tarefa inválido: {status_filtro!r}.")
+    if isinstance(ambiente_filtro, str):
+        ambientes = [] if ambiente_filtro in ("", "Todos", "Todos os ambientes") else [ambiente_filtro]
+    else:
+        ambientes = list(ambiente_filtro or [])
+
+    where, params = [], []
+    textos = ("b.descricao", "b.ambiente", "r.transcricao_audio", "r.resumo_executivo",
+              "r.motivo_atraso", "r.detalhes_execucao_imprevistos")
+    for termo in _termos(termo_busca):
+        campos = " OR ".join(f"norm({c}) LIKE ? ESCAPE '\\'" for c in textos)
+        where.append(
+            f"""({campos} OR EXISTS (
+                    SELECT 1 FROM midias_obra m2 WHERE {_cond_midia_da_tarefa('m2')}
+                    AND (norm(m2.titulo_servico) LIKE ? ESCAPE '\\' OR norm(m2.descricao_tecnica) LIKE ? ESCAPE '\\')))"""
+        )
+        params += [termo] * (len(textos) + 2)
+    if ambientes:
+        where.append(f"b.ambiente IN ({', '.join('?' * len(ambientes))})")
+        params += ambientes
+    if status != "Todas":
+        where.append("b.concluida = ?")
+        params.append(1 if status == "Concluídas" else 0)
+    if data_inicio:
+        where.append("b.data_tarefa >= ?")
+        params.append(data_inicio)
+    if data_fim:
+        where.append("b.data_tarefa <= ?")
+        params.append(data_fim)
+    if apenas_atraso:
+        sql, p = _filtro_atraso(texto_sem_atraso)
+        where.append(f"r.id IS NOT NULL AND {sql}")
+        params += p
+
+    col_r = ", ".join(f"r.{c} AS r_{c}" for c in _COLUNAS_DOSSIE_REGISTRO)
+    col_m = ", ".join(f"m.{c} AS m_{c}" for c in _COLUNAS_DOSSIE_MIDIA)
+    sql = f"""
+        WITH b AS (
+            SELECT t.id, t.obra_id, t.registro_id, t.ambiente, t.descricao, t.concluida, t.data_criacao,
+                   t.data_conclusao,
+                   COALESCE(t.registro_id, (
+                       SELECT r2.id FROM registros_diarios r2
+                       WHERE r2.obra_id = t.obra_id AND r2.data_registro = substr(t.data_criacao, 1, 10)
+                       ORDER BY r2.id DESC LIMIT 1)) AS reg_id,
+                   COALESCE(r0.data_registro, substr(t.data_criacao, 1, 10)) AS data_tarefa
+            FROM tarefas_obra t
+            LEFT JOIN registros_diarios r0 ON r0.id = t.registro_id
+            WHERE t.obra_id = ?
+        )
+        SELECT b.*, r.id AS r_id, {col_r}, {col_m}
+        FROM b
+        LEFT JOIN registros_diarios r ON r.id = b.reg_id
+        LEFT JOIN midias_obra m ON {_cond_midia_da_tarefa('m')}
+        {('WHERE ' + ' AND '.join(where)) if where else ''}
+        ORDER BY b.data_tarefa DESC, b.id DESC, m.data_midia, m.id
+    """
+    with get_connection() as conn:
+        rows = conn.execute(sql, [obra_id] + params).fetchall()
+
+    dossie: dict[int, dict] = {}
+    for row in rows:
+        item = dossie.get(row["id"])
+        if item is None:
+            item = dossie[row["id"]] = {
+                "id": row["id"], "obra_id": row["obra_id"], "registro_id": row["registro_id"],
+                "ambiente": row["ambiente"], "descricao": row["descricao"], "concluida": row["concluida"],
+                "data_criacao": row["data_criacao"], "data_registro_origem": row["data_tarefa"],
+                # Concluída: o dia em que foi marcada como feita ou, se já nasceu feita, o do registro.
+                "data_execucao": (row["data_conclusao"] or row["data_tarefa"]) if row["concluida"] else None,
+                "registro": (
+                    {"id": row["r_id"], **{c: row[f"r_{c}"] for c in _COLUNAS_DOSSIE_REGISTRO}}
+                    if row["r_id"] is not None else None
+                ),
+                "fotos": [],
+            }
+        if row["m_id"] is not None:
+            item["fotos"].append({c: row[f"m_{c}"] for c in _COLUNAS_DOSSIE_MIDIA})
+    resultado = list(dossie.values())
+    if termo_busca and priorizar_diretos:
+        # "vala de infiltração" deve trazer a tarefa da vala, não todas as do mesmo relato:
+        # se alguma tarefa corresponde pelo próprio texto/fotos, só elas entram.
+        diretos = [
+            d for d in resultado
+            if corresponde_busca(termo_busca, d["descricao"], d["ambiente"],
+                                 *(f"{f['titulo_servico'] or ''} {f['descricao_tecnica'] or ''}" for f in d["fotos"]))
+        ]
+        if diretos:
+            return diretos
+    return resultado
 
 
 def listar_ambientes_recomendados(obra_id: Optional[int] = None) -> list[str]:
@@ -893,11 +1024,13 @@ def listar_ambientes_recomendados(obra_id: Optional[int] = None) -> list[str]:
     return list(recomendados.values())
 
 
-def alternar_status_tarefa(tarefa_id: int, concluida: int | bool) -> bool:
-    """Marca a tarefa como concluída (1) ou pendente (0). False se não existir."""
+def alternar_status_tarefa(tarefa_id: int, concluida: int | bool, data_conclusao: Optional[str] = None) -> bool:
+    """Marca a tarefa como concluída (1, registrando o dia) ou pendente (0). False se não existir."""
+    feita = 1 if concluida else 0
     with get_connection() as conn:
         cur = conn.execute(
-            "UPDATE tarefas_obra SET concluida = ? WHERE id = ?", (1 if concluida else 0, tarefa_id)
+            "UPDATE tarefas_obra SET concluida = ?, data_conclusao = ? WHERE id = ?",
+            (feita, (data_conclusao or date.today().isoformat()) if feita else None, tarefa_id),
         )
         return cur.rowcount > 0
 
@@ -986,7 +1119,7 @@ def listar_midias_obra(obra_id: int, registro_id: Optional[int] = None, tarefa_i
             SELECT m.id, m.obra_id, m.registro_id, m.tarefa_id, m.ambiente, m.titulo_servico,
                    m.descricao_tecnica, m.caminho_foto, m.data_midia, m.foto_bytes_original,
                    t.descricao AS tarefa_descricao, t.concluida AS tarefa_concluida,
-                   r.transcricao_audio, r.resumo_executivo, r.nivel_produtividade, r.motivo_atraso
+                   r.transcricao_audio, r.resumo_executivo, r.motivo_atraso, r.detalhes_execucao_imprevistos
             FROM midias_obra m
             LEFT JOIN tarefas_obra t ON t.id = m.tarefa_id
             LEFT JOIN registros_diarios r ON r.id = m.registro_id

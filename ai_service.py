@@ -13,7 +13,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Optional
 
 from dotenv import load_dotenv
 from google import genai
@@ -58,6 +58,7 @@ CODIGOS_RETRY_MESMO_MODELO = {429, 503}
 
 PLACEHOLDER_CHAVE = "sua_chave_aqui"
 SEM_ATRASO = "Sem atrasos registrados"
+SEM_PARTICULARIDADES = "Execução sem particularidades relatadas"
 AVISO_ANALISE_SIMPLIFICADA = (
     "A análise automática não está disponível no momento. O registro foi salvo com uma "
     "análise simplificada — você pode revisá-lo e editá-lo no Histórico."
@@ -119,8 +120,11 @@ class AnaliseDiarioObra(BaseModel):
     resumo_executivo: str = Field(
         description="Atividades concluídas no dia, descritas de forma técnica e profissional para apresentar ao cliente."
     )
-    nivel_produtividade: Literal["Alta", "Média", "Baixa"] = Field(
-        description="Avaliação das entregas do dia versus os imprevistos ocorridos."
+    detalhes_execucao_imprevistos: str = Field(
+        description=(
+            "Resumo das particularidades técnicas do serviço, dificuldades do terreno/estrutura, "
+            "clima ou justificativas de prazo. Factual, sem dar nota ao dia."
+        )
     )
     motivo_atraso: str = Field(
         description=(
@@ -203,7 +207,7 @@ Regras obrigatórias:
     {{"ambiente": "Cozinha", "descricao": "Passagem de tubulação hidráulica", "concluida": true}}].
    Use nomes de ambiente padronizados e com iniciais maiúsculas (Banheiro Social, Cozinha, Sala, Quarto, Área de Serviço, Fachada, Muro, Calçada...). Se o ambiente não for citado, use "Geral". concluida=true para o que foi feito hoje; false para o que ficou pendente ou "falta fazer".
 3) resumo_executivo: serviços executados no dia em linguagem técnica e profissional para o cliente, coerentes com o escopo. Não invente serviços que não foram relatados nem são visíveis.
-4) nivel_produtividade: 'Alta', 'Média' ou 'Baixa', ponderando o volume entregue frente aos imprevistos e ao escopo.
+4) detalhes_execucao_imprevistos: particularidades técnicas do serviço (complexidade, cuidados, etapas de cura/secagem), dificuldades do terreno ou da estrutura encontrada, clima e justificativas de prazo. Seja factual: NÃO atribua nota, conceito ou avaliação de produtividade ao dia — serviços complexos levam mais tempo sem que isso seja baixa produtividade. Sem particularidades, escreva 'Execução sem particularidades relatadas'.
 5) motivo_atraso: chuvas, faltas de funcionários, falta de material ou problemas técnicos que impactaram o prazo, redigidos como justificativa formal (com horários, se citados). Se não houver, escreva exatamente '{SEM_ATRASO}'.
 6) mapeamento_asbuilt: o que as fotos mostram — posição e trajeto de tubulações (água fria/quente, esgoto), conduítes, fiação, caixas, ralos, referências de medida (distância do piso, paredes, cantos) e etapa da reforma. Sem foto, use o que o áudio descrever sobre posições; sem nenhuma informação, escreva 'Sem foto para mapeamento As-Built'.
 7) AMBIENTE (vale para tarefas e fotos): classifique pelo cômodo citado na fala, nas observações ou no escopo. Palavras como banheiro, suíte, lavabo, cozinha, sala, quarto, área de serviço definem o ambiente. Serviços internos — cerâmica, azulejo, piso, porcelanato, revestimento, rejunte, cano, tubulação, hidráulica, ralo, louças, tomadas, fiação — NUNCA são 'Área Externa': se a fala não disser o cômodo, use o cômodo do contexto da conversa ou do escopo da obra. Ex.: "foi retirado a cerâmica do banheiro" → ambiente "Banheiro" (ou "Banheiro Social"), nunca "Área Externa". Use 'Área Externa' só para quintal, jardim, fossa, vala, muro ou calçada.
@@ -382,12 +386,10 @@ def gerar_analise_offline(
     else:
         motivo = SEM_ATRASO
 
-    if paralisou or len(causas) >= 2:
-        nivel = "Baixa"
-    elif causas or not obs:
-        nivel = "Média"
-    else:
-        nivel = "Alta"
+    detalhes = [d for d in causas]
+    if paralisou:
+        detalhes.append("Houve paralisação dos serviços durante o dia")
+    detalhes_txt = ("; ".join(detalhes) + ".") if detalhes else SEM_PARTICULARIDADES
 
     escopo = next(
         (linha.split(":", 1)[1].strip() for linha in contexto_obra.splitlines() if linha.lower().startswith("escopo")),
@@ -420,7 +422,7 @@ def gerar_analise_offline(
     analise = AnaliseDiarioObra(
         transcricao_audio=transcricao,
         resumo_executivo=resumo,
-        nivel_produtividade=nivel,
+        detalhes_execucao_imprevistos=detalhes_txt,
         motivo_atraso=motivo,
         mapeamento_asbuilt=asbuilt,
         tarefas_extraidas=_tarefas_por_regras(obs, contexto_obra),

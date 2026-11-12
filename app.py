@@ -8,7 +8,6 @@ import logging
 import re
 import unicodedata
 import zipfile
-from collections import Counter
 from datetime import date, datetime
 from functools import partial
 from pathlib import Path
@@ -18,20 +17,18 @@ from PIL import Image
 
 import database as db
 import security
-from ai_service import SEM_ATRASO, gerar_analise_offline, processar_registro_obra
+from ai_service import SEM_ATRASO, SEM_PARTICULARIDADES, gerar_analise_offline, processar_registro_obra
 from security import LIMITE_TEXTO_LONGO, MidiaInvalidaError, sanitize_text
 
 BASE_DIR = Path(__file__).resolve().parent
 
-NIVEIS = ("Alta", "Média", "Baixa")
-CLASSE_NIVEL = {"Alta": "alta", "Média": "media", "Baixa": "baixa"}
-ICONE_PRODUTIVIDADE = {"Alta": "🟢", "Média": "🟡", "Baixa": "🔴"}
 ICONE_STATUS = {"Em Andamento": "🚧", "Pausada": "⏸️", "Concluída": "✅"}
 CLASSE_STATUS = {"Em Andamento": "andamento", "Pausada": "pausada", "Concluída": "concluida"}
 FORMATO_AUDIO = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg"}
 TODOS_AMBIENTES = "Todos os ambientes"
 CHAVE_OBRA = "obra_selecionada_id"
 MAX_FOTOS_ENVIO = 10  # fotos por envio (registro, tarefa ou galeria)
+DOSSIE_POR_PAGINA = 10  # cards do dossiê exibidos por vez nos resultados da busca
 TIPOS_FOTO = ["jpg", "jpeg", "png"]
 # Ícone do bloco de ambiente (primeira palavra-chave encontrada, sem acentos).
 ICONES_AMBIENTE = [
@@ -106,6 +103,15 @@ footer {visibility: hidden;}
 [class*="st-key-trow_ok_"] [data-testid="stCheckbox"] p {text-decoration: line-through; opacity: .7;}
 .ot-servico {font-style: italic; opacity: .9; margin: .4rem 0 .2rem;}
 
+/* ---------- Dossiê da tarefa (resultados da busca e detalhes no checklist) ---------- */
+.ot-dossie-titulo {font-size: 1.25rem; font-weight: 800; margin: .3rem 0 .2rem;}
+[class*="st-key-dossie_card_"] {border-left: 6px solid #3b82f6 !important; background: rgba(59, 130, 246, .06);}
+[class*="st-key-dossie_card_"][class*="_ok_"] {border-left-color: #22c55e !important;}
+.ot-dossie-desc {font-size: 1.05rem; font-weight: 700; margin: .35rem 0 .15rem;}
+.ot-dossie-bloco {font-weight: 700; font-size: .9rem; margin: .6rem 0 .15rem; opacity: .9;}
+.st-key-area_dossie {border: 2px solid rgba(59, 130, 246, .55); border-radius: 14px; padding: .6rem .8rem;
+  background: rgba(59, 130, 246, .05);}
+
 /* ---------- Badges (texto herda a cor do tema; o fundo dá o significado) ---------- */
 .ot-badge {
   display: inline-block; padding: .22rem .75rem; margin: .12rem .3rem .12rem 0;
@@ -113,9 +119,8 @@ footer {visibility: hidden;}
   color: inherit; background: rgba(148, 163, 184, .18); border: 1px solid rgba(148, 163, 184, .45);
 }
 .ot-badge-amb {background: rgba(14, 165, 233, .18); border-color: rgba(14, 165, 233, .5);}
-.ot-badge-alta, .ot-badge-concluida {background: rgba(34, 197, 94, .18); border-color: rgba(34, 197, 94, .55);}
-.ot-badge-media, .ot-badge-pausada {background: rgba(245, 158, 11, .2); border-color: rgba(245, 158, 11, .55);}
-.ot-badge-baixa {background: rgba(239, 68, 68, .18); border-color: rgba(239, 68, 68, .55);}
+.ot-badge-concluida, .ot-badge-feita {background: rgba(34, 197, 94, .18); border-color: rgba(34, 197, 94, .55);}
+.ot-badge-pausada, .ot-badge-pendente {background: rgba(245, 158, 11, .2); border-color: rgba(245, 158, 11, .55);}
 .ot-badge-andamento {background: rgba(59, 130, 246, .2); border-color: rgba(59, 130, 246, .55);}
 .ot-badge-completo {background: #16a34a; border-color: #16a34a; color: #ffffff;}
 .ot-tarefas {margin: .2rem 0 .6rem; padding-left: 0; list-style: none;}
@@ -222,10 +227,14 @@ def contexto_da_obra(obra: dict) -> str:
     )
 
 
-def indicadores(registros: list[dict], tarefas: list[dict]) -> dict:
+def tem_detalhes(texto: str | None) -> bool:
+    return bool(texto and texto.strip() and texto.strip() != SEM_PARTICULARIDADES)
+
+
+def indicadores(registros: list[dict], tarefas: list[dict], midias: list[dict] | None = None) -> dict:
+    """Indicadores objetivos da obra (sem notas subjetivas de produtividade)."""
     total = len(tarefas)
     concluidas = sum(t["concluida"] for t in tarefas)
-    niveis = [r["nivel_produtividade"] for r in registros if r["nivel_produtividade"]]
     return {
         "tarefas": total,
         "concluidas": concluidas,
@@ -233,7 +242,7 @@ def indicadores(registros: list[dict], tarefas: list[dict]) -> dict:
         "dias_trabalhados": len({r["data_registro"] for r in registros}),
         "alertas_atraso": len({r["data_registro"] for r in registros if tem_atraso(r["motivo_atraso"])}),
         "registros": len(registros),
-        "predominante": Counter(niveis).most_common(1)[0][0] if niveis else "—",
+        "fotos": len(midias_com_arquivo(midias or [])),
     }
 
 
@@ -350,17 +359,26 @@ def vincular_fotos_do_registro(
     return ids
 
 
-def grade_fotos(fotos: list[tuple[dict, Path]], prefixo: str, colunas: int = 3, acoes: bool = True) -> None:
-    """Grade de miniaturas com ampliar / editar / excluir."""
-    grade = st.columns(colunas)
+def grade_fotos(fotos: list[tuple[dict, Path]], prefixo: str, colunas: int = 3, acoes: bool = True,
+                legenda_tecnica: bool = False) -> None:
+    """Grade de miniaturas com ampliar / editar / excluir (`acoes=False`: só ampliar).
+
+    `legenda_tecnica`: legenda com o serviço e a descrição As-Built em vez do tamanho do arquivo.
+    """
+    grade = st.columns(min(colunas, len(fotos)) or 1)
     for i, (m, foto) in enumerate(fotos):
-        with grade[i % colunas].container(border=True):
+        with grade[i % len(grade)].container(border=True):
             st.image(str(foto), width="stretch")
-            st.caption(info_tamanho(m, foto))
-            if acoes:
-                with st.container(horizontal=True, gap="small"):
-                    if st.button("🔍", key=f"{prefixo}_amp_{m['id']}", help="Ampliar a foto com a descrição técnica"):
-                        dialog_foto(m, foto)
+            if legenda_tecnica:
+                st.markdown(f"**{m.get('titulo_servico') or 'Registro fotográfico'}**")
+                st.caption(f"📐 {m.get('descricao_tecnica') or 'Sem descrição técnica.'}")
+            else:
+                st.caption(info_tamanho(m, foto))
+            with st.container(horizontal=True, gap="small"):
+                if st.button("🔍" if acoes else "🔍 Ampliar", key=f"{prefixo}_amp_{m['id']}",
+                             help="Ampliar a foto com a descrição técnica"):
+                    dialog_foto(m, foto)
+                if acoes:
                     if st.button("✏️", key=f"{prefixo}_edit_{m['id']}", help="Editar ambiente, serviço e descrição da foto"):
                         dialog_editar_midia(m)
                     if st.button("🗑️", key=f"{prefixo}_del_{m['id']}", help="Excluir esta foto"):
@@ -375,11 +393,6 @@ def flash(mensagem: str) -> None:
 def badge(texto: str, classe: str = "") -> str:
     """Badge arredondado em HTML. `texto` precisa já estar escapado."""
     return f"<span class='ot-badge {f'ot-badge-{classe}' if classe else ''}'>{texto}</span>"
-
-
-def badge_nivel(nivel: str | None) -> str:
-    nivel = nivel or "—"
-    return badge(f"{ICONE_PRODUTIVIDADE.get(nivel, '')} Produtividade {esc(nivel)}", CLASSE_NIVEL.get(nivel, ""))
 
 
 def badge_status(status: str) -> str:
@@ -465,7 +478,7 @@ def imagem_base64(caminho: Path, lado_max: int = 900) -> str | None:
 
 def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict], midias: list[dict]) -> str:
     """Relatório autocontido (fotos embutidas, sem metadados) para enviar ou imprimir em PDF."""
-    k = indicadores(registros, tarefas)
+    k = indicadores(registros, tarefas, midias)
     cronologicos = sorted(registros, key=lambda r: (r["data_registro"], r["id"]))
 
     linhas_atraso = "".join(
@@ -504,8 +517,9 @@ def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict],
 
     diario = "".join(
         f"""<section class="dia">
-  <h3>{esc(formatar_data(r['data_registro']))} <span class="pill">Produtividade {esc(r['nivel_produtividade'] or '-')}</span></h3>
+  <h3>{esc(formatar_data(r['data_registro']))}</h3>
   <p><strong>Serviços executados:</strong> {esc(r['resumo_executivo'] or '-')}</p>
+  {f"<p><strong>Detalhes de execução / imprevistos:</strong> {esc(r['detalhes_execucao_imprevistos'])}</p>" if tem_detalhes(r.get('detalhes_execucao_imprevistos')) else ""}
   {f"<p class='atraso'><strong>Justificativa de atraso:</strong> {esc(r['motivo_atraso'])}</p>" if tem_atraso(r['motivo_atraso']) else ""}
 </section>"""
         for r in cronologicos
@@ -548,10 +562,10 @@ def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict],
  Status: {esc(obra['status'])} · Início: {esc(formatar_data(obra['data_inicio']))} · Emitido em {date.today():%d/%m/%Y}</p>
 </header>
 <div class="kpis">
- <div class="kpi"><span>Progresso</span><strong>{pct:.0%}</strong></div>
- <div class="kpi"><span>Tarefas concluídas</span><strong>{k['concluidas']}/{k['tarefas']}</strong></div>
- <div class="kpi"><span>Dias trabalhados</span><strong>{k['dias_trabalhados']}</strong></div>
- <div class="kpi"><span>Dias com atraso justificado</span><strong>{k['alertas_atraso']}</strong></div>
+ <div class="kpi"><span>Progresso do checklist</span><strong>{pct:.0%}</strong></div>
+ <div class="kpi"><span>Tarefas concluídas / total</span><strong>{k['concluidas']}/{k['tarefas']}</strong></div>
+ <div class="kpi"><span>Dias registrados</span><strong>{k['dias_trabalhados']}</strong></div>
+ <div class="kpi"><span>Fotos mapeadas (As-Built)</span><strong>{k['fotos']}</strong></div>
 </div>
 <div class="barra"><div style="width:{pct * 100:.0f}%"></div></div>
 <h2>Checklist por ambiente</h2>
@@ -633,8 +647,9 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
 
         memorial += ["2. HISTÓRICO DA OBRA", sep]
         for r in sorted(registros, key=lambda r: (r["data_registro"], r["id"])):
-            linha = f"{formatar_data(r['data_registro'])} [{r.get('nivel_produtividade') or '-'}] {s(r.get('resumo_executivo') or '-')}"
-            memorial.append(linha)
+            memorial.append(f"{formatar_data(r['data_registro'])} {s(r.get('resumo_executivo') or '-')}")
+            if tem_detalhes(r.get("detalhes_execucao_imprevistos")):
+                memorial.append(f"    Detalhes de execução: {s(r['detalhes_execucao_imprevistos'])}")
             if tem_atraso(r.get("motivo_atraso")):
                 memorial.append(f"    Atraso: {s(r['motivo_atraso'])}")
         if not registros:
@@ -681,12 +696,8 @@ def card_registro(r: dict, tarefas: list[dict] | None = None, com_acoes: bool = 
                   midias: list[dict] | None = None) -> None:
     """Card de um registro: data, badge, áudio, atraso, resumo, tarefas, fotos + As-Built, transcrição."""
     with st.container(border=True):
-        st.markdown(
-            f"<span class='ot-data'>📅 {esc(formatar_data(r['data_registro']))}</span> &nbsp; "
-            f"{badge_nivel(r.get('nivel_produtividade'))}",
-            unsafe_allow_html=True,
-            help="Avaliação das entregas do dia frente aos imprevistos relatados.",
-        )
+        st.markdown(f"<span class='ot-data'>📅 {esc(formatar_data(r['data_registro']))}</span>",
+                    unsafe_allow_html=True)
 
         audio = resolver_caminho(r.get("caminho_audio"))
         if audio:
@@ -699,6 +710,8 @@ def card_registro(r: dict, tarefas: list[dict] | None = None, com_acoes: bool = 
             st.caption(f"✅ {SEM_ATRASO}")
 
         st.markdown(f"**Resumo executivo:** {r.get('resumo_executivo') or '-'}")
+        if tem_detalhes(r.get("detalhes_execucao_imprevistos")):
+            st.info(f"**🔧 Detalhes de execução / imprevistos:** {r['detalhes_execucao_imprevistos']}")
 
         if tarefas:
             st.markdown("**🧱 Tarefas identificadas:**")
@@ -722,7 +735,7 @@ def card_registro(r: dict, tarefas: list[dict] | None = None, com_acoes: bool = 
 
         if com_acoes:
             with st.container(horizontal=True):
-                if st.button("✏️ Editar Registro", key=f"edit_reg_{r['id']}", help="Corrigir transcrição, resumo, produtividade, atrasos ou As-Built."):
+                if st.button("✏️ Editar Registro", key=f"edit_reg_{r['id']}", help="Corrigir transcrição, resumo, detalhes de execução, atrasos ou As-Built."):
                     dialog_editar_registro(r)
                 if st.button("🗑️ Excluir Registro", key=f"del_reg_{r['id']}", help="Remove o registro e o áudio (pede confirmação)."):
                     dialog_excluir_registro(r, len(tarefas or []), len(fotos))
@@ -765,21 +778,21 @@ def seletor_ambiente(rotulo: str, opcoes: list[str], atual: str | None = None, *
 @st.dialog("✏️ Editar Registro", width="large")
 def dialog_editar_registro(r: dict) -> None:
     with st.form(f"form_dialog_reg_{r['id']}", enter_to_submit=False, border=False):
-        c1, c2 = st.columns(2)
-        data_reg = c1.date_input(
+        data_reg = st.date_input(
             "Data do registro", value=para_data(r["data_registro"]), format="DD/MM/YYYY",
             help="Dia a que o relato se refere.",
-        )
-        nivel_atual = r.get("nivel_produtividade")
-        nivel = c2.selectbox(
-            "Produtividade", NIVEIS, index=NIVEIS.index(nivel_atual) if nivel_atual in NIVEIS else 1,
-            help="Entregas do dia frente aos imprevistos.",
         )
         transcricao = st.text_area("Transcrição do áudio", value=r.get("transcricao_audio") or "", height=140,
                                    max_chars=LIMITE_TEXTO_LONGO,
                                    help="Texto do relato falado. Corrija palavras que tenham sido mal entendidas.")
         resumo = st.text_area("Resumo executivo", value=r.get("resumo_executivo") or "", max_chars=LIMITE_TEXTO_LONGO,
                               help="Serviços do dia como serão apresentados ao cliente.")
+        detalhes = st.text_area(
+            "Detalhes de execução / imprevistos", value=r.get("detalhes_execucao_imprevistos") or "",
+            max_chars=LIMITE_TEXTO_LONGO,
+            help="Particularidades técnicas do serviço, dificuldades do terreno/estrutura, clima ou "
+            "justificativas de prazo.",
+        )
         motivo = st.text_area("Justificativa de atraso", value=r.get("motivo_atraso") or SEM_ATRASO,
                               max_chars=LIMITE_TEXTO_LONGO,
                               help=f"Chuva, faltas, material ou problemas técnicos. Sem atraso: '{SEM_ATRASO}'.")
@@ -790,7 +803,7 @@ def dialog_editar_registro(r: dict) -> None:
             longo = partial(sanitize_text, max_length=LIMITE_TEXTO_LONGO)
             db.atualizar_registro_diario(
                 r["id"], data_reg.isoformat(), longo(transcricao), longo(resumo),
-                nivel, longo(motivo) or SEM_ATRASO, longo(asbuilt),
+                longo(motivo) or SEM_ATRASO, longo(detalhes), longo(asbuilt),
             )
             flash("Registro atualizado.")
             st.rerun()
@@ -853,6 +866,8 @@ def dialog_foto(m: dict, foto: Path) -> None:
         st.markdown(f"**Tarefa vinculada:** {'✅' if m.get('tarefa_concluida') else '⏳'} {m['tarefa_descricao']}")
     if m.get("resumo_executivo"):
         st.markdown(f"**Serviços do dia:** {m['resumo_executivo']}")
+    if tem_detalhes(m.get("detalhes_execucao_imprevistos")):
+        st.info(f"**🔧 Detalhes de execução / imprevistos:** {m['detalhes_execucao_imprevistos']}")
     if tem_atraso(m.get("motivo_atraso")):
         st.warning(f"**Justificativa de atraso:** {m['motivo_atraso']}", icon="⚠️")
 
@@ -911,6 +926,14 @@ def _ao_marcar_tarefa(tarefa_id: int, descricao: str) -> None:
     flash(f"“{descricao}” {'marcada como ✅ feita' if feita else 'voltou para ⏳ pendente'}.")
 
 
+def _alternar_dossie(chave: str) -> None:
+    st.session_state[chave] = not st.session_state.get(chave, False)
+
+
+def _mostrar_mais_dossie(chave: str) -> None:
+    st.session_state[chave] = st.session_state.get(chave, DOSSIE_POR_PAGINA) + DOSSIE_POR_PAGINA
+
+
 def _ao_excluir_tarefa(tarefa_id: int, descricao: str) -> None:
     db.excluir_tarefa(tarefa_id)
     st.session_state.pop(f"tarefa_{tarefa_id}", None)
@@ -918,12 +941,13 @@ def _ao_excluir_tarefa(tarefa_id: int, descricao: str) -> None:
 
 
 def _chaves_filtro(obra_id: int) -> dict[str, str]:
-    return {nome: f"f_{nome}_{obra_id}" for nome in ("busca", "ambientes", "status", "niveis", "datas", "atraso")}
+    return {nome: f"f_{nome}_{obra_id}" for nome in ("busca", "ambientes", "status", "datas", "atraso")}
 
 
 def _limpar_filtros(obra_id: int) -> None:
     """Reseta a busca global, os Filtros avançados e os filtros da galeria."""
-    for chave in [*_chaves_filtro(obra_id).values(), f"galeria_amb_{obra_id}", f"galeria_txt_{obra_id}"]:
+    for chave in [*_chaves_filtro(obra_id).values(), f"galeria_amb_{obra_id}", f"galeria_txt_{obra_id}",
+                  f"dossie_lim_{obra_id}"]:
         st.session_state.pop(chave, None)
 
 
@@ -998,7 +1022,7 @@ if obra_id is None:
             )
             escopo = st.text_area(
                 "Escopo da Obra", placeholder="Serviços contratados", max_chars=LIM_ESCOPO,
-                help="Serviços, metragens e materiais contratados. Usado para avaliar a produtividade do dia.",
+                help="Serviços, metragens e materiais contratados. Ajuda a IA a identificar ambientes e serviços.",
             )
             c_status, c_inicio = st.columns(2)
             status = c_status.selectbox(
@@ -1052,7 +1076,7 @@ with c_gerenciar.popover("⚙️", help="Editar ou excluir este bloco"):
         e_end = st.text_input("Endereço", value=obra.get("endereco") or "", max_chars=LIM_ENDERECO,
                               help="Endereço da obra.")
         e_escopo = st.text_area("Escopo da Obra", value=obra.get("escopo_resumo") or "", max_chars=LIM_ESCOPO,
-                                help="Serviços contratados, usados na avaliação de produtividade.")
+                                help="Serviços contratados. Ajuda a IA a identificar ambientes e serviços.")
         e_status = st.selectbox("Status", db.STATUS_OBRA, index=db.STATUS_OBRA.index(obra["status"]),
                                 help="Situação atual da obra.")
         e_inicio = st.date_input("Data de início", value=para_data(obra["data_inicio"]), format="DD/MM/YYYY",
@@ -1067,7 +1091,7 @@ with c_gerenciar.popover("⚙️", help="Editar ou excluir este bloco"):
                 st.error("Informe o nome da cliente/obra.")
     excluir_bloco = st.button("🗑️ Excluir bloco", width="stretch", help="Apaga a obra e todos os seus dados.")
 
-# Status e produtividade predominante (preenchido no fim, junto com os KPIs)
+# Status da obra (preenchido no fim, junto com os KPIs)
 area_badges = st.empty()
 st.markdown(
     f"📍 {obra.get('endereco') or 'Endereço não informado'} · Início em {formatar_data(obra['data_inicio'])}"
@@ -1088,8 +1112,9 @@ busca_global = c_busca.text_input(
     "Busca global na obra",
     placeholder="🔍 Pesquisar em tarefas, ambientes, transcrições, serviços das fotos...",
     key=chaves["busca"], max_chars=LIM_BUSCA,
-    help="Filtra o checklist, o histórico e a galeria. Procura em ambiente, tarefa, transcrição, resumo "
-    "do dia e serviço das fotos. Várias palavras: todas precisam aparecer. Não diferencia maiúsculas nem acentos.",
+    help="Mostra logo abaixo o dossiê de cada tarefa encontrada (dia, relato, áudio e fotos) e filtra o "
+    "checklist, o histórico e a galeria. Procura em ambiente, tarefa, transcrição, resumo e detalhes do dia "
+    "e serviço/descrição das fotos. Várias palavras: todas precisam aparecer. Não diferencia maiúsculas nem acentos.",
 )
 c_limpar.button("✖️ Limpar Filtros", key=f"btn_limpar_topo_{obra_id}", on_click=_limpar_filtros, args=(obra_id,),
                 width="stretch", help="Apaga a busca e todos os filtros avançados de uma vez.")
@@ -1102,7 +1127,7 @@ if chaves["ambientes"] in st.session_state:
     st.session_state[chaves["ambientes"]] = [a for a in st.session_state[chaves["ambientes"]] if a in ambientes_da_obra]
 
 filtros_abertos = any(
-    st.session_state.get(chaves[n]) for n in ("ambientes", "niveis", "datas", "atraso")
+    st.session_state.get(chaves[n]) for n in ("ambientes", "datas", "atraso")
 ) or st.session_state.get(chaves["status"]) not in (None, "Todas")
 with st.expander("⚙️ Filtros avançados", expanded=filtros_abertos):
     c1, c2 = st.columns(2)
@@ -1110,10 +1135,7 @@ with st.expander("⚙️ Filtros avançados", expanded=filtros_abertos):
                                  placeholder="Todos", help="Checklist, registros e fotos destes cômodos.")
     f_status = c2.segmented_control("Status da tarefa", db.STATUS_TAREFA, default="Todas", key=chaves["status"],
                                     help="Vale para o checklist.") or "Todas"
-    c3, c4 = st.columns(2)
-    f_niveis = c3.multiselect("Produtividade", NIVEIS, key=chaves["niveis"], placeholder="Todas",
-                              help="Registros (e tarefas extraídas deles) com estes níveis.")
-    f_datas = c4.date_input("Intervalo de datas", value=(), format="DD/MM/YYYY", key=chaves["datas"],
+    f_datas = st.date_input("Intervalo de datas", value=(), format="DD/MM/YYYY", key=chaves["datas"],
                             help="Escolha a data inicial e a final. Uma só data filtra a partir dela.")
     f_atraso = st.toggle("Apenas dias com atraso/imprevisto", key=chaves["atraso"],
                          help="Somente registros com justificativa de atraso (chuva, faltas, material...).")
@@ -1123,14 +1145,14 @@ datas = tuple(f_datas) if isinstance(f_datas, (list, tuple)) else ((f_datas,) if
 filtro = dict(
     busca=sanitize_text(busca_global, LIM_BUSCA),
     ambientes=f_ambientes or None,
-    niveis=f_niveis or None,
     data_inicio=datas[0].isoformat() if datas else None,
     data_fim=datas[1].isoformat() if len(datas) > 1 else None,
     apenas_atraso=f_atraso,
     texto_sem_atraso=SEM_ATRASO,
 )
-filtrando = bool(filtro["busca"] or f_ambientes or f_niveis or datas or f_atraso or f_status != "Todas")
-area_resultado_busca = st.empty()
+filtrando = bool(filtro["busca"] or f_ambientes or datas or f_atraso or f_status != "Todas")
+# Resultados da busca (Dossiê Completo): logo abaixo da barra de busca, preenchido após os dados.
+area_resultado_busca = st.container()
 
 aba_registro, aba_checklist, aba_historico, aba_galeria = st.tabs([
     "🎙️ Novo Registro (Áudio/Foto)",
@@ -1217,7 +1239,7 @@ with aba_registro:
                     analise = gerar_analise_offline(obs, contexto_da_obra(obra), audio_abs is not None, fotos_abs)
 
             dados = {
-                campo: (valor if campo == "nivel_produtividade" else sanitize_text(valor, LIMITE_TEXTO_LONGO))
+                campo: sanitize_text(valor, LIMITE_TEXTO_LONGO)
                 for campo, valor in analise.model_dump(exclude={"tarefas_extraidas", "fotos_classificadas"}).items()
             }
             novo_id = db.inserir_registro(
@@ -1255,7 +1277,15 @@ with aba_registro:
 registros = db.listar_registros_por_obra(obra_id)
 tarefas = db.listar_tarefas_obra(obra_id)
 registros_filtrados = db.buscar_registros(obra_id, **filtro) if filtrando else registros
-tarefas_filtradas = db.buscar_tarefas(obra_id, status=f_status, **filtro) if filtrando else tarefas
+# Dossiê de todas as tarefas (detalhes no checklist) e o resultado da busca/filtros.
+dossie_por_tarefa = {d["id"]: d for d in db.buscar_dossie_tarefas(obra_id)}
+dossie_encontrado = db.buscar_dossie_tarefas(
+    obra_id, termo_busca=filtro["busca"], ambiente_filtro=filtro["ambientes"] or "Todos", status_filtro=f_status,
+    data_inicio=filtro["data_inicio"], data_fim=filtro["data_fim"], apenas_atraso=f_atraso,
+    texto_sem_atraso=SEM_ATRASO,
+) if filtrando else []
+_ids_encontrados = {d["id"] for d in dossie_encontrado}
+tarefas_filtradas = [t for t in tarefas if t["id"] in _ids_encontrados] if filtrando else tarefas
 mapa_tarefas = tarefas_por_registro(tarefas)
 midias_obra = db.listar_midias_obra(obra_id)  # recarrega: o registro acima pode ter adicionado fotos
 midias_por_registro: dict[int, list[dict]] = {}
@@ -1272,10 +1302,10 @@ def filtrar_midias(midias: list[dict]) -> list[dict]:
     if not filtrando:
         return midias
     ids_registros = None
-    if filtro["niveis"] or filtro["apenas_atraso"]:
-        # Produtividade/atraso pertencem ao registro do dia em que a foto foi enviada.
+    if filtro["apenas_atraso"]:
+        # O atraso pertence ao registro do dia em que a foto foi enviada.
         ids_registros = {r["id"] for r in db.buscar_registros(
-            obra_id, niveis=filtro["niveis"], apenas_atraso=filtro["apenas_atraso"], texto_sem_atraso=SEM_ATRASO)}
+            obra_id, apenas_atraso=True, texto_sem_atraso=SEM_ATRASO)}
     return [
         m for m in midias
         if midia_corresponde(m, filtro["busca"])
@@ -1288,11 +1318,84 @@ def filtrar_midias(midias: list[dict]) -> list[dict]:
 if excluir_bloco:
     dialog_excluir_obra(obra, len(registros), len(tarefas))
 
+
+
+def conteudo_dossie(d: dict, prefixo: str) -> None:
+    """Dia da execução, relato do dia (resumo, detalhes, atraso, áudio, transcrição) e fotos da tarefa."""
+    reg = d.get("registro")
+    if d["concluida"]:
+        data_txt = f"📅 Realizado em: {formatar_data(d['data_execucao'])}"
+    else:
+        data_txt = f"📅 Registrada em: {formatar_data(d['data_registro_origem'])} · ainda não executada"
+    st.markdown(f"<span class='ot-data'>{esc(data_txt)}</span>", unsafe_allow_html=True)
+
+    st.markdown("<div class='ot-dossie-bloco'>🗒️ Contexto do dia</div>", unsafe_allow_html=True)
+    if reg is None:
+        st.caption("Tarefa adicionada manualmente, sem registro diário (relato) vinculado.")
+    else:
+        if reg["data_registro"] != d.get("data_execucao"):
+            st.caption(f"Relato do dia {formatar_data(reg['data_registro'])}")
+        st.markdown(f"**Resumo do dia:** {reg.get('resumo_executivo') or '-'}")
+        if tem_detalhes(reg.get("detalhes_execucao_imprevistos")):
+            st.info(f"**🔧 Detalhes de execução / imprevistos:** {reg['detalhes_execucao_imprevistos']}")
+        if tem_atraso(reg.get("motivo_atraso")):
+            st.warning(f"**Justificativa de atraso:** {reg['motivo_atraso']}", icon="⚠️")
+        if audio_d := resolver_caminho(reg.get("caminho_audio")):
+            st.caption("🎙️ Relato original do canteiro")
+            tocar_audio(audio_d)
+        if reg.get("transcricao_audio"):
+            with st.expander("📝 Transcrição do relato"):
+                st.write(reg["transcricao_audio"])
+
+    fotos_d = midias_com_arquivo([
+        {**f, "obra_id": d["obra_id"], "tarefa_descricao": d["descricao"], "tarefa_concluida": d["concluida"],
+         **({k: reg.get(k) for k in ("resumo_executivo", "motivo_atraso", "detalhes_execucao_imprevistos")} if reg else {})}
+        for f in d["fotos"]
+    ])
+    st.markdown(f"<div class='ot-dossie-bloco'>📷 Fotos do serviço ({len(fotos_d)})</div>", unsafe_allow_html=True)
+    if fotos_d:
+        grade_fotos(fotos_d, prefixo=prefixo, acoes=False, legenda_tecnica=True)
+    else:
+        st.caption("Nenhuma foto vinculada. Anexe pelo 📷 da tarefa no checklist.")
+
+
+def card_dossie(d: dict) -> None:
+    """Card completo de uma tarefa encontrada na busca."""
+    secao = "ok" if d["concluida"] else "pend"
+    with st.container(border=True, key=f"dossie_card_{secao}_{d['id']}"):
+        status = badge("✅ Concluída", "feita") if d["concluida"] else badge("⏳ Pendente", "pendente")
+        local = badge(icone_ambiente(d["ambiente"]) + " " + esc(d["ambiente"], LIM_AMBIENTE), "amb")
+        st.markdown(
+            f"{status}{local}"
+            f"<div class='ot-dossie-desc'>{esc(d['descricao'], LIM_TAREFA)}</div>",
+            unsafe_allow_html=True,
+        )
+        conteudo_dossie(d, prefixo=f"dos_{d['id']}")
+
+
 if filtrando:
-    area_resultado_busca.caption(
-        f"🔎 Filtro ativo: {len(tarefas_filtradas)} de {len(tarefas)} tarefa(s) · "
-        f"{len(registros_filtrados)} de {len(registros)} registro(s)."
-    )
+    with area_resultado_busca.container(key="area_dossie"):
+        st.markdown("<div class='ot-dossie-titulo'>🔎 Resultados Encontrados (Dossiê Completo)</div>",
+                    unsafe_allow_html=True)
+        st.caption(
+            f"{len(dossie_encontrado)} de {len(tarefas)} tarefa(s) · "
+            f"{len(registros_filtrados)} de {len(registros)} registro(s) do diário. Cada card reúne a tarefa, "
+            "o relato do dia e as fotos do serviço."
+        )
+        if not dossie_encontrado:
+            st.info("Nenhuma tarefa encontrada com a busca/filtros atuais."
+                    + (" Há registros do diário que correspondem: veja a aba “Histórico e Diários”."
+                       if registros_filtrados else ""))
+        chave_lim = f"dossie_lim_{obra_id}"
+        limite = st.session_state.get(chave_lim, DOSSIE_POR_PAGINA)
+        for d in dossie_encontrado[:limite]:
+            card_dossie(d)
+        if len(dossie_encontrado) > limite:
+            st.button(f"Mostrar mais resultados ({len(dossie_encontrado) - limite} restantes)",
+                      key=f"dossie_mais_{obra_id}", on_click=_mostrar_mais_dossie, args=(chave_lim,),
+                      width="stretch")
+        st.button("✖️ Limpar busca e filtros", key=f"dossie_limpar_{obra_id}", on_click=_limpar_filtros,
+                  args=(obra_id,), width="stretch")
 
 
 # --------------------------------------------------------------------------- #
@@ -1343,6 +1446,15 @@ def linha_tarefa(t: dict) -> None:
                             st.rerun()
         st.button("🗑️", key=f"del_tarefa_{t['id']}", on_click=_ao_excluir_tarefa,
                   args=(t["id"], t["descricao"]), help="Excluir esta tarefa do checklist (as fotos ficam na galeria)")
+    # Dossiê da tarefa sob demanda (só renderiza fotos/áudio quando aberto).
+    chave_det = f"dossie_aberto_{t['id']}"
+    aberto = st.session_state.get(chave_det, False)
+    st.button("🙈 Ocultar detalhes" if aberto else "👁️ Ver detalhes do dia e fotos", key=f"btn_det_{t['id']}",
+              on_click=_alternar_dossie, args=(chave_det,), type="tertiary",
+              help="Data de execução, relato do dia, áudio e fotos desta tarefa, aqui mesmo.")
+    if aberto and (d := dossie_por_tarefa.get(t["id"])):
+        with st.container(border=True):
+            conteudo_dossie(d, prefixo=f"chk_{t['id']}")
 
 
 with aba_checklist:
@@ -1566,19 +1678,15 @@ with aba_galeria:
 # --------------------------------------------------------------------------- #
 # KPIs do bloco (desenhados por último, no espaço reservado acima das abas)
 # --------------------------------------------------------------------------- #
-k = indicadores(registros, tarefas)
-area_badges.markdown(
-    badge_status(obra["status"]) + (badge_nivel(k["predominante"]) if k["predominante"] != "—" else ""),
-    unsafe_allow_html=True,
-)
+k = indicadores(registros, tarefas, midias_obra)
+area_badges.markdown(badge_status(obra["status"]), unsafe_allow_html=True)
 with area_metricas:
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Progresso", f"{k['progresso']:.0%}", border=True,
+    m1.metric("Progresso do Checklist (%)", f"{k['progresso']:.0%}", border=True,
               help="Percentual de tarefas do checklist já concluídas.")
-    m2.metric("Total de Tarefas", k["tarefas"], border=True,
-              help=f"{k['concluidas']} concluída(s) e {k['tarefas'] - k['concluidas']} pendente(s) no checklist.")
-    m3.metric("Dias Trabalhados", k["dias_trabalhados"], border=True,
+    m2.metric("Tarefas Concluídas / Total", f"{k['concluidas']}/{k['tarefas']}", border=True,
+              help=f"{k['tarefas'] - k['concluidas']} tarefa(s) pendente(s) no checklist.")
+    m3.metric("Dias Registrados", k["dias_trabalhados"], border=True,
               help="Dias distintos com registro no diário de obra.")
-    m4.metric("Alertas de Atraso", k["alertas_atraso"], border=True,
-              help="Dias com chuva, falta de funcionário, material ou problema técnico documentado. "
-              "Base para pedido de aditivo de prazo.")
+    m4.metric("Fotos Mapeadas (As-Built)", k["fotos"], border=True,
+              help="Fotos técnicas na Galeria da Obra, com ambiente e serviço.")

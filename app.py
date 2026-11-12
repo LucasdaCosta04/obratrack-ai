@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import html
 import io
-import uuid
 from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
@@ -14,13 +13,19 @@ import streamlit as st
 from PIL import Image, ImageOps
 
 import database as db
-from ai_service import processar_registro_obra
+from ai_service import (
+    SEM_ATRASO,
+    gerar_analise_demo,
+    obter_api_key,
+    processar_registro_obra,
+    salvar_api_key,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOADS_DIR = db.UPLOADS_DIR
-SEM_ATRASO = "Sem atrasos registrados"
 
 COR_PRODUTIVIDADE = {"Alta": "green", "Média": "orange", "Baixa": "red"}
+ICONE_PRODUTIVIDADE = {"Alta": "🟢", "Média": "🟡", "Baixa": "🔴"}
 ICONE_STATUS = {"Em Andamento": "🚧", "Pausada": "⏸️", "Concluída": "✅"}
 
 st.set_page_config(
@@ -36,12 +41,13 @@ st.set_page_config(
 # --------------------------------------------------------------------------- #
 @st.cache_resource
 def _inicializar_banco() -> bool:
-    db.init_db()
+    db.init_db()  # cria tabelas e aplica migrações (ex.: coluna caminho_audio)
     db.seed_data()
     return True
 
 
 _inicializar_banco()
+st.session_state.setdefault("modo_demo", False)
 
 
 # --------------------------------------------------------------------------- #
@@ -60,12 +66,10 @@ def resolver_caminho(caminho: str | None) -> Path | None:
     return p if p.is_file() else None
 
 
-def salvar_upload(dados: bytes, obra_id: int, prefixo: str, sufixo: str) -> Path:
-    """Salva bytes em uploads\\obra_<id>\\ com nome único e retorna o caminho relativo."""
-    pasta = UPLOADS_DIR / f"obra_{obra_id}"
-    pasta.mkdir(parents=True, exist_ok=True)
-    nome = f"{prefixo}_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}{sufixo.lower()}"
-    destino = pasta / nome
+def salvar_upload(dados: bytes, prefixo: str, sufixo: str) -> Path:
+    """Salva em uploads\\<prefixo>_<timestamp><sufixo> e retorna o caminho relativo ao projeto."""
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    destino = UPLOADS_DIR / f"{prefixo}_{datetime.now():%Y%m%d_%H%M%S_%f}{sufixo.lower()}"
     destino.write_bytes(dados)
     return destino.relative_to(BASE_DIR)
 
@@ -111,22 +115,28 @@ def gerar_relatorio_html(obra: dict, registros: list[dict]) -> str:
     """Relatório autocontido (fotos embutidas) para enviar ao cliente ou imprimir em PDF."""
     e = html.escape
     total, dias_atraso, predominante = metricas(registros)
+    cronologicos = sorted(registros, key=lambda r: (r["data_registro"], r["id"]))
     linhas_atraso = "".join(
         f"<tr><td>{e(formatar_data(r['data_registro']))}</td><td>{e(r['motivo_atraso'])}</td></tr>"
-        for r in sorted(registros, key=lambda r: (r["data_registro"], r["id"]))
+        for r in cronologicos
         if tem_atraso(r["motivo_atraso"])
     ) or f"<tr><td colspan='2'>{SEM_ATRASO} no período.</td></tr>"
 
     blocos = []
-    for r in sorted(registros, key=lambda r: (r["data_registro"], r["id"])):
+    for r in cronologicos:
         foto = resolver_caminho(r["caminho_foto"])
         b64 = imagem_base64(foto) if foto else None
         img_tag = f"<img src='data:image/jpeg;base64,{b64}' alt='Foto do dia'>" if b64 else ""
+        atraso = (
+            f"<p class='atraso'><strong>Justificativa de atraso:</strong> {e(r['motivo_atraso'])}</p>"
+            if tem_atraso(r["motivo_atraso"])
+            else ""
+        )
         blocos.append(
             f"""<section class="dia">
   <h3>{e(formatar_data(r['data_registro']))} — Produtividade {e(r['nivel_produtividade'] or '-')}</h3>
   <p><strong>Serviços executados:</strong> {e(r['resumo_executivo'] or '-')}</p>
-  {f"<p class='atraso'><strong>Justificativa de atraso:</strong> {e(r['motivo_atraso'])}</p>" if tem_atraso(r['motivo_atraso']) else ""}
+  {atraso}
   {img_tag}
   <p><strong>Registro As-Built:</strong> {e(r['mapeamento_asbuilt'] or '-')}</p>
 </section>"""
@@ -161,17 +171,76 @@ Status: {e(obra['status'])} · Início: {e(formatar_data(obra['data_inicio']))} 
 </body></html>"""
 
 
+def card_registro(r: dict) -> None:
+    """Card de um registro: data, badge, áudio, atraso, resumo, foto + As-Built, transcrição."""
+    with st.container(border=True):
+        nivel = r.get("nivel_produtividade") or "—"
+        topo_data, topo_badge = st.columns([3, 2], vertical_alignment="center")
+        topo_data.markdown(f"**📅 {formatar_data(r['data_registro'])}**")
+        with topo_badge:
+            st.badge(
+                f"{ICONE_PRODUTIVIDADE.get(nivel, '')} Produtividade {nivel}",
+                color=COR_PRODUTIVIDADE.get(nivel, "gray"),
+                help="Avaliação das entregas do dia frente aos imprevistos relatados.",
+            )
+
+        audio = resolver_caminho(r.get("caminho_audio"))
+        if audio:
+            st.caption("🎙️ Relato original do canteiro")
+            st.audio(str(audio), format="audio/wav")
+
+        if tem_atraso(r.get("motivo_atraso")):
+            st.warning(f"**Justificativa de atraso:** {r['motivo_atraso']}", icon="⚠️")
+        else:
+            st.caption(f"✅ {SEM_ATRASO}")
+
+        st.markdown(f"**Resumo executivo:** {r.get('resumo_executivo') or '-'}")
+
+        foto = resolver_caminho(r.get("caminho_foto"))
+        if foto:
+            c_foto, c_txt = st.columns([1, 1])
+            c_foto.image(str(foto), width="stretch")
+            c_txt.markdown(f"**📐 Mapeamento As-Built:**\n\n{r.get('mapeamento_asbuilt') or '-'}")
+        elif r.get("mapeamento_asbuilt"):
+            st.markdown(f"**📐 Mapeamento As-Built:** {r['mapeamento_asbuilt']}")
+
+        if r.get("transcricao_audio"):
+            with st.expander("📝 Transcrição do áudio"):
+                st.write(r["transcricao_audio"])
+
+
 # --------------------------------------------------------------------------- #
-# Sidebar: cadastro de Bloco de Cliente/Obra
+# Sidebar: cadastro de Bloco de Cliente/Obra + configurações da IA
 # --------------------------------------------------------------------------- #
 with st.sidebar:
     st.header("➕ Novo Bloco de Cliente/Obra")
-    with st.form("form_nova_obra", clear_on_submit=True):
-        nome = st.text_input("Nome da Cliente / Obra *", placeholder="Ex.: Reforma Cozinha - Sra. Ana")
-        endereco = st.text_input("Endereço")
-        escopo = st.text_area("Escopo da Obra", placeholder="Serviços contratados, metragens, materiais...")
-        status = st.selectbox("Status", db.STATUS_OBRA)
-        inicio = st.date_input("Data de início", value=date.today(), format="DD/MM/YYYY")
+    with st.form("form_nova_obra", clear_on_submit=True, enter_to_submit=False):
+        nome = st.text_input(
+            "Nome da Cliente / Obra *",
+            placeholder="Ex.: Reforma Cozinha - Sra. Ana",
+            help="Nome que identifica o bloco na tela principal. Use o padrão 'Serviço - Cliente'.",
+        )
+        endereco = st.text_input(
+            "Endereço",
+            placeholder="Rua, número - bairro",
+            help="Endereço da obra. Aparece no cabeçalho do bloco e no relatório do cliente.",
+        )
+        escopo = st.text_area(
+            "Escopo da Obra",
+            placeholder="Serviços contratados",
+            help="Serviços, metragens e materiais contratados. A IA usa este escopo para avaliar a produtividade do dia.",
+        )
+        status = st.selectbox(
+            "Status",
+            db.STATUS_OBRA,
+            help="Situação atual da obra. Pode ser cadastrada já pausada ou concluída.",
+        )
+        inicio = st.date_input(
+            "Data de início",
+            value=date.today(),
+            format="DD/MM/YYYY",
+            help="Data em que a obra começou (ou começará).",
+        )
         criar = st.form_submit_button("Cadastrar Bloco", type="primary", width="stretch")
 
     if criar:
@@ -184,6 +253,36 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
+    with st.expander("⚙️ Configurações da IA"):
+        chave_atual = obter_api_key()
+        if st.session_state["modo_demo"]:
+            st.caption("🧪 Modo Demonstração ativo: nenhuma chamada à IA será feita.")
+        elif chave_atual:
+            st.caption(f"✅ Chave configurada (termina em …{chave_atual[-4:]}).")
+        else:
+            st.caption("⚠️ Nenhuma chave configurada. Os registros serão salvos em Modo Demonstração.")
+
+        with st.form("form_api_key", clear_on_submit=True, enter_to_submit=False, border=False):
+            nova_chave = st.text_input(
+                "GEMINI_API_KEY",
+                type="password",
+                placeholder="AIza...",
+                help="Gere a chave em aistudio.google.com/apikey. Ela será salva no arquivo .env do projeto.",
+            )
+            if st.form_submit_button("Salvar chave no .env", width="stretch"):
+                if nova_chave.strip():
+                    salvar_api_key(nova_chave)
+                    st.session_state["flash"] = "Chave da API salva no .env."
+                    st.rerun()
+                else:
+                    st.error("Cole uma chave válida antes de salvar.")
+
+        st.checkbox(
+            "Usar Modo Demonstração (Sem chave de API)",
+            key="modo_demo",
+            help="Gera a análise por regras locais a partir das observações, sem chamar o Gemini. Ideal para testar a interface.",
+        )
+
     st.caption("ObraTrack AI · Diário de obra com IA multimodal (Gemini 2.5 Flash)")
 
 
@@ -204,7 +303,7 @@ ids_validos = {o["id"] for o in obras}
 if st.session_state.get("obra_id") not in ids_validos:
     st.session_state["obra_id"] = obras[0]["id"]
 
-st.subheader("Blocos de Clientes/Obras")
+st.subheader("Blocos de Clientes/Obras", help="Toque em um bloco para abrir o diário daquela cliente.")
 colunas = st.columns(2)  # em telas estreitas o Streamlit empilha as colunas
 for i, o in enumerate(obras):
     selecionada = o["id"] == st.session_state["obra_id"]
@@ -223,7 +322,6 @@ for i, o in enumerate(obras):
 
 obra = next(o for o in obras if o["id"] == st.session_state["obra_id"])
 obra_id = obra["id"]
-registros = db.listar_registros_por_obra(obra_id)
 
 # Cabeçalho do bloco selecionado
 st.divider()
@@ -235,83 +333,97 @@ st.markdown(
 if obra.get("escopo_resumo"):
     st.caption(f"Escopo: {obra['escopo_resumo']}")
 
-total, dias_atraso, predominante = metricas(registros)
-m1, m2, m3 = st.columns(3)
-m1.metric("Total de Registros", total, border=True)
-m2.metric("Dias c/ Atraso Justificado", dias_atraso, border=True)
-m3.metric("Produtividade Predominante", predominante, border=True)
+# As métricas são desenhadas no fim do script, para já refletirem um registro recém-salvo.
+area_metricas = st.container()
 
 aba_registro, aba_historico = st.tabs(
     ["🎙️ Registrar Dia (Áudio e Foto)", "📚 Histórico, Produtividade e Documentação As-Built"]
 )
 
 
-def exibir_resultado(analise: dict, foto: Path | None) -> None:
-    nivel = analise["nivel_produtividade"]
-    st.badge(f"Produtividade {nivel}", color=COR_PRODUTIVIDADE.get(nivel, "gray"))
-    if tem_atraso(analise["motivo_atraso"]):
-        st.warning(f"**Justificativa de atraso:** {analise['motivo_atraso']}", icon="⚠️")
-    st.markdown(f"**Resumo executivo:** {analise['resumo_executivo']}")
-    if foto:
-        c_foto, c_txt = st.columns([1, 1])
-        c_foto.image(str(foto), width="stretch")
-        c_txt.markdown(f"**Mapeamento As-Built:**\n\n{analise['mapeamento_asbuilt']}")
-    else:
-        st.markdown(f"**Mapeamento As-Built:** {analise['mapeamento_asbuilt']}")
-    if analise.get("transcricao_audio"):
-        with st.expander("Transcrição do áudio"):
-            st.write(analise["transcricao_audio"])
-
-
 # --------------------------------------------------------------------------- #
 # Aba 1: Registrar Dia
 # --------------------------------------------------------------------------- #
 with aba_registro:
-    with st.form(f"form_registro_{obra_id}", clear_on_submit=True):
-        audio = st.audio_input("Gravar relato do dia no canteiro")
-        foto_up = st.file_uploader("Adicionar foto da reforma / tubulação", type=["jpg", "jpeg", "png"])
-        obs = st.text_area("Observações (opcional)", placeholder="Ex.: faltou 1 pedreiro; choveu das 14h às 16h.")
-        data_reg = st.date_input("Data do registro", value=date.today(), format="DD/MM/YYYY")
+    # enter_to_submit=False: Enter num campo não dispara o processamento sem querer.
+    with st.form(f"form_registro_{obra_id}", clear_on_submit=True, enter_to_submit=False):
+        audio = st.audio_input(
+            "Gravar relato do dia no canteiro",
+            help="Toque no microfone e conte o que foi feito, o que atrasou (chuva, faltas, material) "
+            "e onde passaram canos/fios. A IA transcreve e extrai tudo da sua voz.",
+        )
+        foto_up = st.file_uploader(
+            "Adicionar foto da reforma / tubulação",
+            type=["jpg", "jpeg", "png"],
+            help="Fotografe a parede/piso ANTES do reboco ou revestimento, com uma referência de medida. "
+            "A IA descreve a posição das tubulações para o As-Built.",
+        )
+        c_obs, c_data = st.columns([2, 1])
+        obs = c_obs.text_input(
+            "Observações rápidas (opcional)",
+            placeholder="Ex: faltou 1 pedreiro",
+            help="Digite uma nota curta ou deixe em branco e fale tudo no áudio.",
+        )
+        data_reg = c_data.date_input(
+            "Data do registro",
+            value=date.today(),
+            format="DD/MM/YYYY",
+            help="Dia a que o relato se refere. Altere para lançar um dia anterior.",
+        )
         enviar = st.form_submit_button("Processar com IA e Salvar no Bloco", type="primary", width="stretch")
 
     if enviar:
         if not (audio or foto_up or obs.strip()):
             st.error("Grave um áudio, envie uma foto ou escreva uma observação.")
         else:
-            salvos: list[Path] = []
-            try:
-                caminho_audio = caminho_foto = None
-                if audio:
-                    caminho_audio = salvar_upload(audio.getvalue(), obra_id, "audio", ".wav")
-                    salvos.append(caminho_audio)
-                if foto_up:
-                    caminho_foto = salvar_upload(
-                        foto_up.getvalue(), obra_id, "foto", Path(foto_up.name).suffix or ".jpg"
-                    )
-                    salvos.append(caminho_foto)
+            caminho_audio = salvar_upload(audio.getvalue(), "audio", ".wav") if audio else None
+            caminho_foto = (
+                salvar_upload(foto_up.getvalue(), "foto", Path(foto_up.name).suffix or ".jpg") if foto_up else None
+            )
+            audio_abs = BASE_DIR / caminho_audio if caminho_audio else None
+            foto_abs = BASE_DIR / caminho_foto if caminho_foto else None
 
-                with st.spinner("Analisando áudio, foto e contexto da obra com IA..."):
+            rotulo = "Gerando análise em Modo Demonstração..." if st.session_state["modo_demo"] else (
+                "Transcrevendo o áudio e analisando a foto com IA..."
+            )
+            with st.spinner(rotulo):
+                try:
                     analise = processar_registro_obra(
-                        caminho_audio=BASE_DIR / caminho_audio if caminho_audio else None,
-                        caminho_foto=BASE_DIR / caminho_foto if caminho_foto else None,
+                        caminho_audio=audio_abs,
+                        caminho_foto=foto_abs,
                         observacoes_texto=obs,
                         contexto_obra=contexto_da_obra(obra),
-                    ).model_dump()
+                        modo_demo=st.session_state["modo_demo"],
+                    )
+                except Exception as exc:  # nunca perde o registro: cai no modo demonstração
+                    analise = gerar_analise_demo(
+                        obs, contexto_da_obra(obra), audio_abs is not None, foto_abs,
+                        aviso=f"Falha ao consultar a IA ({exc}). Registro salvo em Modo Demonstração.",
+                    )
 
-                db.inserir_registro(
-                    obra_id=obra_id,
-                    data_registro=data_reg.isoformat(),
-                    caminho_foto=caminho_foto,
-                    **analise,
-                )
-            except Exception as exc:  # mostra o erro na tela e não deixa arquivos órfãos
-                for p in salvos:
-                    (BASE_DIR / p).unlink(missing_ok=True)
-                st.error(f"Não foi possível processar o registro: {exc}")
-            else:
-                st.success("Registro salvo no bloco da obra.")
-                exibir_resultado(analise, BASE_DIR / caminho_foto if caminho_foto else None)
-                registros = db.listar_registros_por_obra(obra_id)
+            dados = analise.model_dump()
+            novo_id = db.inserir_registro(
+                obra_id=obra_id,
+                data_registro=data_reg.isoformat(),
+                caminho_foto=caminho_foto,
+                caminho_audio=caminho_audio,
+                **dados,
+            )
+
+            st.success("Registro salvo com sucesso no bloco da cliente!")
+            if analise.modo_demo:
+                st.info(analise.aviso, icon="🧪")
+            card_registro(
+                {
+                    "id": novo_id,
+                    "data_registro": data_reg.isoformat(),
+                    "caminho_foto": str(caminho_foto) if caminho_foto else None,
+                    "caminho_audio": str(caminho_audio) if caminho_audio else None,
+                    **dados,
+                }
+            )
+
+registros = db.listar_registros_por_obra(obra_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -344,29 +456,31 @@ with aba_historico:
                 mime="text/html",
                 width="stretch",
                 on_click="ignore",
+                help="Arquivo único com fotos embutidas. Abra no navegador e use Ctrl+P para salvar em PDF.",
             )
 
         for r in registros:  # já vem do mais recente para o mais antigo
-            with st.container(border=True):
-                topo_data, topo_badge = st.columns([3, 2])
-                topo_data.markdown(f"**📅 {formatar_data(r['data_registro'])}**")
-                with topo_badge:
-                    nivel = r["nivel_produtividade"] or "—"
-                    st.badge(f"Produtividade {nivel}", color=COR_PRODUTIVIDADE.get(nivel, "gray"))
+            card_registro(r)
 
-                if tem_atraso(r["motivo_atraso"]):
-                    st.warning(f"**Justificativa de atraso:** {r['motivo_atraso']}", icon="⚠️")
 
-                st.markdown(f"**Resumo executivo:** {r['resumo_executivo'] or '-'}")
-
-                foto = resolver_caminho(r["caminho_foto"])
-                if foto:
-                    c_foto, c_txt = st.columns([1, 1])
-                    c_foto.image(str(foto), width="stretch")
-                    c_txt.markdown(f"**Mapeamento As-Built:**\n\n{r['mapeamento_asbuilt'] or '-'}")
-                elif r["mapeamento_asbuilt"]:
-                    st.markdown(f"**Mapeamento As-Built:** {r['mapeamento_asbuilt']}")
-
-                if r["transcricao_audio"]:
-                    with st.expander("Transcrição do áudio"):
-                        st.write(r["transcricao_audio"])
+# --------------------------------------------------------------------------- #
+# Métricas do bloco (desenhadas por último, no espaço reservado acima das abas)
+# --------------------------------------------------------------------------- #
+total, dias_atraso, predominante = metricas(registros)
+with area_metricas:
+    m1, m2, m3 = st.columns(3)
+    m1.metric(
+        "Total de Registros", total, border=True,
+        help="Quantidade de dias/relatos registrados neste bloco.",
+    )
+    m2.metric(
+        "Dias c/ Atraso Justificado", dias_atraso, border=True,
+        help="Dias distintos com chuva, falta de funcionário, material ou problema técnico documentado. "
+        "Base para pedido de aditivo de prazo.",
+    )
+    m3.metric(
+        "Produtividade Predominante",
+        f"{ICONE_PRODUTIVIDADE.get(predominante, '')} {predominante}".strip(),
+        border=True,
+        help="Nível de produtividade mais frequente entre os registros da obra.",
+    )

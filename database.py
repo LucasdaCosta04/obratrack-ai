@@ -59,6 +59,7 @@ def init_db() -> None:
                 motivo_atraso        TEXT,
                 mapeamento_asbuilt   TEXT,
                 caminho_foto         TEXT,
+                caminho_audio        TEXT,
                 FOREIGN KEY (obra_id) REFERENCES clientes_obras (id) ON DELETE CASCADE
             );
 
@@ -66,6 +67,14 @@ def init_db() -> None:
                 ON registros_diarios (obra_id);
             """
         )
+        _migrar(conn)
+
+
+def _migrar(conn: sqlite3.Connection) -> None:
+    """Migrações idempotentes para bancos criados por versões anteriores."""
+    colunas = {row["name"] for row in conn.execute("PRAGMA table_info(registros_diarios)")}
+    if "caminho_audio" not in colunas:
+        conn.execute("ALTER TABLE registros_diarios ADD COLUMN caminho_audio TEXT")
 
 
 def listar_obras() -> list[dict]:
@@ -107,6 +116,7 @@ def inserir_registro(
     motivo_atraso: str = "",
     mapeamento_asbuilt: str = "",
     caminho_foto: Optional[str | Path] = None,
+    caminho_audio: Optional[str | Path] = None,
     data_registro: Optional[str] = None,
 ) -> int:
     """Insere um registro diário vinculado a uma obra e retorna o seu id."""
@@ -117,13 +127,15 @@ def inserir_registro(
         )
     data_registro = data_registro or date.today().isoformat()
     foto = str(Path(caminho_foto)) if caminho_foto else None
+    audio = str(Path(caminho_audio)) if caminho_audio else None
     with get_connection() as conn:
         cur = conn.execute(
             """
             INSERT INTO registros_diarios (
                 obra_id, data_registro, transcricao_audio, resumo_executivo,
-                nivel_produtividade, motivo_atraso, mapeamento_asbuilt, caminho_foto
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                nivel_produtividade, motivo_atraso, mapeamento_asbuilt,
+                caminho_foto, caminho_audio
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 obra_id,
@@ -134,6 +146,7 @@ def inserir_registro(
                 motivo_atraso,
                 mapeamento_asbuilt,
                 foto,
+                audio,
             ),
         )
         return int(cur.lastrowid)
@@ -144,7 +157,10 @@ def listar_registros_por_obra(obra_id: int) -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute(
             """
-            SELECT * FROM registros_diarios
+            SELECT id, obra_id, data_registro, transcricao_audio, resumo_executivo,
+                   nivel_produtividade, motivo_atraso, mapeamento_asbuilt,
+                   caminho_foto, caminho_audio
+            FROM registros_diarios
             WHERE obra_id = ?
             ORDER BY data_registro DESC, id DESC
             """,

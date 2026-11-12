@@ -5,8 +5,11 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import re
+import unicodedata
+import zipfile
 from collections import Counter
-from datetime import date
+from datetime import date, datetime
 from functools import partial
 from pathlib import Path
 
@@ -26,16 +29,12 @@ ICONE_PRODUTIVIDADE = {"Alta": "🟢", "Média": "🟡", "Baixa": "🔴"}
 ICONE_STATUS = {"Em Andamento": "🚧", "Pausada": "⏸️", "Concluída": "✅"}
 CLASSE_STATUS = {"Em Andamento": "andamento", "Pausada": "pausada", "Concluída": "concluida"}
 FORMATO_AUDIO = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg"}
-AMBIENTES_SUGERIDOS = [
-    "Geral", "Banheiro Social", "Banheiro Suíte", "Lavabo", "Cozinha", "Área de Serviço",
-    "Sala", "Quarto", "Varanda", "Garagem", "Fachada", "Muro", "Calçada", "Cobertura",
-]
-FILTROS_STATUS = ("Todas", "Pendentes", "Concluídas")
 TODOS_AMBIENTES = "Todos os ambientes"
+CHAVE_OBRA = "obra_selecionada_id"
 
 # Limites de tamanho dos campos digitados (também aplicados no servidor via sanitize_text).
 LIM_NOME, LIM_ENDERECO, LIM_ESCOPO = 120, 200, 2_000
-LIM_OBS, LIM_AMBIENTE, LIM_TAREFA = 500, 60, 300
+LIM_OBS, LIM_AMBIENTE, LIM_TAREFA, LIM_BUSCA = 500, 60, 300, 120
 
 st.set_page_config(
     page_title="ObraTrack AI",
@@ -44,60 +43,57 @@ st.set_page_config(
     initial_sidebar_state="auto",
 )
 
-# CSS estático (nenhum dado de usuário é interpolado aqui).
+# CSS estático (nenhum dado de usuário é interpolado aqui). As cores usam transparência e
+# `color: inherit` para funcionar tanto no tema escuro (padrão) quanto no claro.
 st.markdown(
     """
 <style>
-#MainMenu {visibility: hidden;}
 header .stAppDeployButton, [data-testid="stAppDeployButton"] {display: none;}
 footer {visibility: hidden;}
 
-/* ---------- Cards dos Blocos de Clientes ---------- */
+/* ---------- Cards dos blocos ---------- */
 [class*="st-key-obra_card"] {
-  background: #ffffff; border-radius: 14px !important;
-  border-left: 6px solid #cbd5e1 !important;
-  box-shadow: 0 1px 3px rgba(15, 23, 42, .08);
+  background: rgba(148, 163, 184, .08); border-radius: 14px !important;
+  border-left: 6px solid rgba(148, 163, 184, .55) !important;
 }
-[class*="st-key-obra_card_ativo"] {
-  border-left-color: #1d4ed8 !important;
-  box-shadow: 0 0 0 2px rgba(29, 78, 216, .25), 0 4px 12px rgba(15, 23, 42, .10);
-}
-.ot-card-titulo {font-weight: 700; font-size: 1.05rem; line-height: 1.3; color: #0f172a;}
-.ot-card-sub {color: #64748b; font-size: .85rem; margin: .15rem 0 .5rem;}
-.ot-barra {height: 8px; background: #e2e8f0; border-radius: 999px; overflow: hidden;}
-.ot-barra > div {height: 100%; background: linear-gradient(90deg, #1d4ed8, #16a34a); border-radius: 999px;}
-.ot-card-meta {color: #475569; font-size: .8rem; margin-top: .35rem;}
+.ot-card-titulo {font-weight: 700; font-size: 1.05rem; line-height: 1.3;}
+.ot-card-sub {opacity: .72; font-size: .85rem; margin: .15rem 0 .5rem;}
+.ot-barra {height: 8px; background: rgba(148, 163, 184, .25); border-radius: 999px; overflow: hidden;}
+.ot-barra > div {height: 100%; background: linear-gradient(90deg, #3b82f6, #22c55e); border-radius: 999px;}
+.ot-card-meta {opacity: .75; font-size: .8rem; margin-top: .35rem;}
+.ot-muted {opacity: .72; font-size: .85rem;}
 
 /* ---------- KPIs ---------- */
-[data-testid="stMetric"] {
-  background: #ffffff; border-radius: 14px; padding: .75rem 1rem;
-  box-shadow: 0 1px 3px rgba(15, 23, 42, .08);
-}
-[data-testid="stMetricValue"] {font-weight: 700; color: #0f172a;}
+[data-testid="stMetric"] {background: rgba(148, 163, 184, .08); border-radius: 14px; padding: .75rem 1rem;}
+[data-testid="stMetricValue"] {font-weight: 700;}
 
-/* ---------- Badges ---------- */
+/* ---------- Badges (texto herda a cor do tema; o fundo dá o significado) ---------- */
 .ot-badge {
   display: inline-block; padding: .22rem .75rem; margin: .12rem .3rem .12rem 0;
-  border-radius: 999px; font-size: .8rem; font-weight: 600; line-height: 1.4;
-  background: #f1f5f9; color: #334155; border: 1px solid #e2e8f0; white-space: nowrap;
+  border-radius: 999px; font-size: .8rem; font-weight: 600; line-height: 1.4; white-space: nowrap;
+  color: inherit; background: rgba(148, 163, 184, .18); border: 1px solid rgba(148, 163, 184, .45);
 }
-.ot-badge-amb {background: #e0f2fe; color: #075985; border-color: #bae6fd;}
-.ot-badge-alta {background: #dcfce7; color: #166534; border-color: #bbf7d0;}
-.ot-badge-media {background: #fef3c7; color: #92400e; border-color: #fde68a;}
-.ot-badge-baixa {background: #fee2e2; color: #991b1b; border-color: #fecaca;}
-.ot-badge-andamento {background: #dbeafe; color: #1e40af; border-color: #bfdbfe;}
-.ot-badge-pausada {background: #fef3c7; color: #92400e; border-color: #fde68a;}
-.ot-badge-concluida {background: #dcfce7; color: #166534; border-color: #bbf7d0;}
-.ot-badge-completo {background: #16a34a; color: #ffffff; border-color: #16a34a;}
+.ot-badge-amb {background: rgba(14, 165, 233, .18); border-color: rgba(14, 165, 233, .5);}
+.ot-badge-alta, .ot-badge-concluida {background: rgba(34, 197, 94, .18); border-color: rgba(34, 197, 94, .55);}
+.ot-badge-media, .ot-badge-pausada {background: rgba(245, 158, 11, .2); border-color: rgba(245, 158, 11, .55);}
+.ot-badge-baixa {background: rgba(239, 68, 68, .18); border-color: rgba(239, 68, 68, .55);}
+.ot-badge-andamento {background: rgba(59, 130, 246, .2); border-color: rgba(59, 130, 246, .55);}
+.ot-badge-completo {background: #16a34a; border-color: #16a34a; color: #ffffff;}
 .ot-tarefas {margin: .2rem 0 .6rem; padding-left: 0; list-style: none;}
 .ot-tarefas li {margin: .2rem 0;}
-.ot-data {font-weight: 700; color: #0f172a;}
+.ot-data {font-weight: 700;}
+
+/* ---------- Botão "Criar Novo Bloco" em destaque na barra lateral ---------- */
+.st-key-btn_novo_bloco button {
+  border: 2px dashed #22c55e !important; background: rgba(34, 197, 94, .14) !important; font-weight: 700;
+}
 
 /* ---------- Área de toque confortável (canteiro / luva / tela suja) ---------- */
 .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button,
 [data-testid="stPopover"] > div > button, [data-testid="stPopoverButton"] {
   min-height: 3rem; border-radius: 10px; font-weight: 600; padding: .5rem 1rem;
 }
+[data-testid="stSidebar"] .stButton > button {justify-content: flex-start; text-align: left;}
 [data-testid="stCheckbox"] label {min-height: 2.75rem; align-items: center; padding: .3rem 0;}
 [data-testid="stCheckbox"] label > span:first-child {transform: scale(1.3); margin-right: .7rem;}
 .stTabs [data-baseweb="tab"] {min-height: 3rem; padding: 0 .9rem;}
@@ -122,6 +118,7 @@ def _inicializar() -> bool:
 
 _inicializar()
 security.check_auth()  # com PIN configurado, nada abaixo é renderizado sem autenticação
+st.session_state.setdefault(CHAVE_OBRA, None)  # estado inicial: nenhum bloco aberto
 
 
 # --------------------------------------------------------------------------- #
@@ -156,6 +153,22 @@ def para_data(iso: str) -> date:
         return date.today()
 
 
+def formatar_bytes(n: int | None) -> str:
+    if not n:
+        return "-"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n / (1024 * 1024):.1f} MB".replace(".", ",")
+
+
+def slug(texto: str) -> str:
+    """'Banheiro Social' -> 'Banheiro-Social' (seguro para nome de arquivo)."""
+    sem_acento = "".join(
+        c for c in unicodedata.normalize("NFKD", texto or "") if not unicodedata.combining(c)
+    )
+    return re.sub(r"[^A-Za-z0-9]+", "-", sem_acento).strip("-")[:40] or "Geral"
+
+
 def contexto_da_obra(obra: dict) -> str:
     return (
         f"Cliente/Obra: {obra['nome_cliente']}\n"
@@ -185,6 +198,24 @@ def agrupar_por_ambiente(tarefas: list[dict]) -> dict[str, list[dict]]:
     for t in tarefas:
         grupos.setdefault(t["ambiente"] or "Geral", []).append(t)
     return grupos
+
+
+def tarefas_por_registro(tarefas: list[dict]) -> dict[int, list[dict]]:
+    mapa: dict[int, list[dict]] = {}
+    for t in tarefas:
+        if t["registro_id"]:
+            mapa.setdefault(t["registro_id"], []).append(t)
+    return mapa
+
+
+def ambientes_do_registro(r: dict, mapa_tarefas: dict[int, list[dict]], conhecidos: list[str]) -> list[str]:
+    """Ambientes de um registro: os das tarefas extraídas dele ou, sem tarefas, os citados no texto."""
+    das_tarefas = list(dict.fromkeys(t["ambiente"] for t in mapa_tarefas.get(r["id"], [])))
+    if das_tarefas:
+        return das_tarefas
+    texto = db.normalizar_busca(f"{r.get('mapeamento_asbuilt') or ''} {r.get('resumo_executivo') or ''}")
+    citados = [a for a in conhecidos if db.normalizar_busca(a) in texto]
+    return citados or ["Geral"]
 
 
 def registros_com_foto(registros: list[dict]) -> list[tuple[dict, Path]]:
@@ -222,16 +253,27 @@ def barra_texto(pct: float, segmentos: int = 10) -> str:
     return "🟩" * cheios + "⬜" * (segmentos - cheios)
 
 
+def info_tamanho(r: dict, foto: Path) -> str:
+    """'📦 168 KB · 97% menor que o original (5,2 MB)'."""
+    atual = foto.stat().st_size
+    original = r.get("foto_bytes_original")
+    if original and original > atual:
+        return f"📦 {formatar_bytes(atual)} · {1 - atual / original:.0%} menor que o original ({formatar_bytes(original)})"
+    return f"📦 {formatar_bytes(atual)}"
+
+
+def selecionar_obra(obra_id: int | None) -> None:
+    st.session_state[CHAVE_OBRA] = obra_id
+
+
 # --------------------------------------------------------------------------- #
-# Relatórios para o cliente
+# Relatórios para o cliente e a arquiteta
 # --------------------------------------------------------------------------- #
 def gerar_resumo_whatsapp(obra: dict, registros: list[dict], tarefas: list[dict]) -> str:
     """Texto pronto para colar no WhatsApp (*negrito* e _itálico_ do próprio WhatsApp)."""
     s = sanitize_text
     k = indicadores(registros, tarefas)
-    linhas = [
-        f"*🏗️ Relatório de Obra — {s(obra['nome_cliente'], LIM_NOME)}*",
-    ]
+    linhas = [f"*🏗️ Relatório de Obra — {s(obra['nome_cliente'], LIM_NOME)}*"]
     if obra.get("endereco"):
         linhas.append(f"📍 {s(obra['endereco'], LIM_ENDERECO)}")
     linhas += [
@@ -325,7 +367,7 @@ def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict])
 <title>Relatório de Obra — {esc(obra['nome_cliente'], LIM_NOME)}</title>
 <style>
  *{{box-sizing:border-box}}
- body{{font-family:"Segoe UI",Arial,sans-serif;max-width:900px;margin:24px auto;padding:0 18px;color:#1e293b;line-height:1.45}}
+ body{{font-family:"Segoe UI",Arial,sans-serif;max-width:900px;margin:24px auto;padding:0 18px;color:#1e293b;background:#fff;line-height:1.45}}
  header{{border-bottom:3px solid #1d4ed8;padding-bottom:10px;margin-bottom:18px}}
  h1{{margin:0;font-size:1.6rem}} h2{{font-size:1.15rem;margin:26px 0 10px;color:#1d4ed8}}
  h3{{font-size:1rem;margin:0 0 6px}} .meta{{color:#475569;margin:6px 0 0}}
@@ -371,6 +413,90 @@ def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict])
 {diario}
 <footer>Relatório gerado pelo ObraTrack AI em {date.today():%d/%m/%Y}.</footer>
 </body></html>"""
+
+
+def _bytes_foto_para_zip(foto: Path) -> bytes:
+    """Bytes da foto para o ZIP. Fotos antigas que ainda tenham metadados são limpas antes."""
+    dados = foto.read_bytes()
+    try:
+        with Image.open(io.BytesIO(dados)) as img:
+            tem_metadados = bool(img.getexif()) or any(k in img.info for k in ("exif", "xmp", "icc_profile"))
+    except Exception:
+        return dados
+    return security.strip_image_exif(dados) if tem_metadados else dados
+
+
+def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict]) -> bytes:
+    """ZIP em memória com as fotos renomeadas (01_2026-11-12_Banheiro-Social.jpg) e o memorial.
+
+    Os nomes organizados existem só dentro do ZIP; no servidor as fotos seguem com nome UUID.
+    """
+    s = sanitize_text
+    mapa = tarefas_por_registro(tarefas)
+    conhecidos = db.listar_ambientes_recomendados(obra["id"])
+    fotos = sorted(registros_com_foto(registros), key=lambda x: (x[0]["data_registro"], x[0]["id"]))
+
+    sep = "=" * 72
+    memorial = [
+        "MEMORIAL DESCRITIVO AS-BUILT",
+        sep,
+        f"Obra/Cliente : {s(obra['nome_cliente'], LIM_NOME)}",
+        f"Endereço     : {s(obra.get('endereco') or 'não informado', LIM_ENDERECO)}",
+        f"Escopo       : {s(obra.get('escopo_resumo') or 'não informado', LIM_ESCOPO)}",
+        f"Status       : {obra['status']} · Início em {formatar_data(obra['data_inicio'])}",
+        f"Emitido em   : {datetime.now():%d/%m/%Y %H:%M}",
+        f"Fotos        : {len(fotos)}",
+        "",
+        "Cada foto registra a posição real de tubulações, conduítes e fiação antes do",
+        "fechamento (reboco/revestimento). Consulte antes de furar paredes ou pisos.",
+        "",
+        "1. FOTOS E DESCRIÇÃO TÉCNICA",
+        sep,
+    ]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for i, (r, foto) in enumerate(fotos, start=1):
+            ambientes = ambientes_do_registro(r, mapa, conhecidos)
+            nome = f"{i:02d}_{r['data_registro']}_{slug(ambientes[0])}{foto.suffix.lower()}"
+            zf.writestr(nome, _bytes_foto_para_zip(foto), compress_type=zipfile.ZIP_STORED)
+            memorial += [
+                f"[{i:02d}] {nome}",
+                f"     Data       : {formatar_data(r['data_registro'])}",
+                f"     Ambiente(s): {', '.join(s(a, LIM_AMBIENTE) for a in ambientes)}",
+                f"     As-Built   : {s(r.get('mapeamento_asbuilt') or '-')}",
+                f"     Serviços   : {s(r.get('resumo_executivo') or '-')}",
+            ]
+            if tem_atraso(r.get("motivo_atraso")):
+                memorial.append(f"     Atraso     : {s(r['motivo_atraso'])}")
+            memorial.append("")
+        if not fotos:
+            memorial += ["Nenhuma foto técnica registrada.", ""]
+
+        memorial += ["2. HISTÓRICO DA OBRA", sep]
+        for r in sorted(registros, key=lambda r: (r["data_registro"], r["id"])):
+            linha = f"{formatar_data(r['data_registro'])} [{r.get('nivel_produtividade') or '-'}] {s(r.get('resumo_executivo') or '-')}"
+            memorial.append(linha)
+            if tem_atraso(r.get("motivo_atraso")):
+                memorial.append(f"    Atraso: {s(r['motivo_atraso'])}")
+        if not registros:
+            memorial.append("Nenhum registro.")
+
+        memorial += ["", "3. CHECKLIST POR AMBIENTE", sep]
+        for ambiente, itens in agrupar_por_ambiente(tarefas).items():
+            feitas = sum(t["concluida"] for t in itens)
+            memorial.append(f"{s(ambiente, LIM_AMBIENTE)} ({feitas}/{len(itens)})")
+            memorial += [f"  [{'x' if t['concluida'] else ' '}] {s(t['descricao'], LIM_TAREFA)}" for t in itens]
+        if not tarefas:
+            memorial.append("Nenhuma tarefa registrada.")
+        memorial += ["", "Gerado pelo ObraTrack AI."]
+
+        # utf-8-sig + CRLF: acentos e quebras de linha corretos no Bloco de Notas do Windows.
+        zf.writestr(
+            "Memorial_Descritivo_AsBuilt.txt",
+            "\r\n".join(memorial).encode("utf-8-sig"),
+            compress_type=zipfile.ZIP_DEFLATED,
+        )
+    return buf.getvalue()
 
 
 # --------------------------------------------------------------------------- #
@@ -436,6 +562,37 @@ def card_registro(r: dict, tarefas: list[dict] | None = None, com_acoes: bool = 
                     dialog_editar_registro(r)
                 if st.button("🗑️ Excluir Registro", key=f"del_reg_{r['id']}", help="Remove o registro, o áudio e a foto (pede confirmação)."):
                     dialog_excluir_registro(r, len(tarefas or []))
+
+
+def card_obra(o: dict, resumo: dict, selecionada: bool, chave: str) -> None:
+    """Card executivo de um bloco (usado nos atalhos da tela de boas-vindas)."""
+    pct = resumo["concluidas"] / resumo["tarefas"] if resumo["tarefas"] else 0.0
+    with st.container(border=True, key=f"obra_card_{chave}_{o['id']}"):
+        st.markdown(
+            f"<div class='ot-card-titulo'>{esc(o['nome_cliente'], LIM_NOME)}</div>"
+            f"<div class='ot-card-sub'>📍 {esc(o.get('endereco') or 'Endereço não informado', LIM_ENDERECO)}</div>"
+            f"{badge_status(o['status'])}"
+            f"<div class='ot-barra' style='margin-top:.5rem'><div style='width:{pct * 100:.0f}%'></div></div>"
+            f"<div class='ot-card-meta'>{pct:.0%} concluído · {resumo['concluidas']}/{resumo['tarefas']} tarefas · "
+            f"{resumo['registros']} registro(s)</div>",
+            unsafe_allow_html=True,
+        )
+        st.button("Abrir bloco", key=f"abrir_{chave}_{o['id']}", width="stretch",
+                  type="primary" if selecionada else "secondary",
+                  on_click=selecionar_obra, args=(o["id"],))
+
+
+def seletor_ambiente(rotulo: str, opcoes: list[str], atual: str | None = None, **kwargs) -> str | None:
+    """Selectbox com os ambientes recomendados e opção de digitar um novo."""
+    if atual and atual not in opcoes:
+        opcoes = [atual, *opcoes]
+    return st.selectbox(
+        rotulo, opcoes, index=opcoes.index(atual) if atual else None,
+        placeholder="Escolha ou + digite novo ambiente...", accept_new_options=True,
+        help="Sugestões aprendidas com as tarefas desta e das outras obras. Para um cômodo novo, "
+        "digite o nome e confirme.",
+        **kwargs,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -510,13 +667,28 @@ def dialog_excluir_obra(obra: dict, qtd_registros: int, qtd_tarefas: int) -> Non
         st.rerun()
     if c2.button("Excluir bloco", type="primary", width="stretch", disabled=not confirmado):
         db.excluir_obra(obra["id"])
-        st.session_state.pop("obra_id", None)
+        selecionar_obra(None)
         flash(f"Bloco “{obra['nome_cliente']}” excluído.")
         st.rerun()
 
 
+@st.dialog("📐 Foto As-Built", width="large")
+def dialog_foto(r: dict, foto: Path, ambientes: list[str]) -> None:
+    st.image(str(foto), width="stretch")
+    st.markdown(
+        f"<span class='ot-data'>📅 {esc(formatar_data(r['data_registro']))}</span> &nbsp; "
+        + "".join(badge_ambiente(a) for a in ambientes),
+        unsafe_allow_html=True,
+    )
+    st.caption(info_tamanho(r, foto))
+    st.markdown(f"**📐 Descrição técnica (canos, conduítes e fiação):**\n\n{r.get('mapeamento_asbuilt') or '-'}")
+    st.markdown(f"**Serviços do dia:** {r.get('resumo_executivo') or '-'}")
+    if tem_atraso(r.get("motivo_atraso")):
+        st.warning(f"**Justificativa de atraso:** {r['motivo_atraso']}", icon="⚠️")
+
+
 # --------------------------------------------------------------------------- #
-# Callbacks do checklist (rodam antes do script, atualizando o banco na hora)
+# Callbacks (rodam antes do script, atualizando o banco/estado na hora)
 # --------------------------------------------------------------------------- #
 def _ao_marcar_tarefa(tarefa_id: int) -> None:
     db.alternar_status_tarefa(tarefa_id, st.session_state[f"tarefa_{tarefa_id}"])
@@ -528,120 +700,137 @@ def _ao_excluir_tarefa(tarefa_id: int, descricao: str) -> None:
     flash(f"Tarefa “{descricao}” excluída.")
 
 
-# --------------------------------------------------------------------------- #
-# Sidebar: cadastro de Bloco de Cliente/Obra
-# --------------------------------------------------------------------------- #
-with st.sidebar:
-    st.header("➕ Novo Bloco de Cliente/Obra")
-    with st.form("form_nova_obra", clear_on_submit=True, enter_to_submit=False):
-        nome = st.text_input(
-            "Nome da Cliente / Obra *",
-            placeholder="Ex.: Reforma Cozinha - Sra. Ana",
-            max_chars=LIM_NOME,
-            help="Nome que identifica o bloco na tela principal. Use o padrão 'Serviço - Cliente'.",
-        )
-        endereco = st.text_input(
-            "Endereço",
-            placeholder="Rua, número - bairro",
-            max_chars=LIM_ENDERECO,
-            help="Endereço da obra. Aparece no cabeçalho do bloco e no relatório do cliente.",
-        )
-        escopo = st.text_area(
-            "Escopo da Obra",
-            placeholder="Serviços contratados",
-            max_chars=LIM_ESCOPO,
-            help="Serviços, metragens e materiais contratados. Usado para avaliar a produtividade do dia.",
-        )
-        status = st.selectbox(
-            "Status",
-            db.STATUS_OBRA,
-            help="Situação atual da obra. Pode ser cadastrada já pausada ou concluída.",
-        )
-        inicio = st.date_input(
-            "Data de início",
-            value=date.today(),
-            format="DD/MM/YYYY",
-            help="Data em que a obra começou (ou começará).",
-        )
-        criar = st.form_submit_button("Cadastrar Bloco", type="primary", width="stretch")
+def _chaves_filtro(obra_id: int) -> dict[str, str]:
+    return {nome: f"f_{nome}_{obra_id}" for nome in ("busca", "ambientes", "status", "niveis", "datas", "atraso")}
 
-    if criar:
-        nome_limpo = sanitize_text(nome, LIM_NOME)
-        if not nome_limpo:
-            st.error("Informe o nome da cliente/obra.")
-        else:
-            novo_id = db.criar_obra(
-                nome_limpo, sanitize_text(endereco, LIM_ENDERECO), sanitize_text(escopo, LIM_ESCOPO),
-                status, inicio.isoformat(),
-            )
-            st.session_state["obra_id"] = novo_id
-            flash(f"Bloco “{nome_limpo}” cadastrado.")
-            st.rerun()
+
+def _limpar_filtros(obra_id: int) -> None:
+    for chave in _chaves_filtro(obra_id).values():
+        st.session_state.pop(chave, None)
+
+
+# --------------------------------------------------------------------------- #
+# Barra lateral: busca rápida e navegação entre os blocos
+# --------------------------------------------------------------------------- #
+obras = db.listar_obras()
+ids_validos = {o["id"] for o in obras}
+if st.session_state[CHAVE_OBRA] not in ids_validos:
+    selecionar_obra(None)
+obra_id = st.session_state[CHAVE_OBRA]
+
+with st.sidebar:
+    st.markdown("### 🏗️ ObraTrack AI")
+    busca_cliente = st.text_input(
+        "Filtrar blocos", placeholder="🔍 Filtrar cliente/endereço...", key="busca_cliente",
+        max_chars=LIM_BUSCA, label_visibility="collapsed",
+        help="Digite parte do nome do cliente ou do endereço.",
+    )
+    st.button("➕ Criar Novo Bloco de Cliente", key="btn_novo_bloco", width="stretch",
+              on_click=selecionar_obra, args=(None,),
+              help="Abre o cadastro de um novo bloco de cliente/obra na tela principal.")
+
+    termo_cliente = db.normalizar_busca(sanitize_text(busca_cliente, LIM_BUSCA))
+    obras_visiveis = [
+        o for o in obras
+        if not termo_cliente or termo_cliente in db.normalizar_busca(f"{o['nome_cliente']} {o.get('endereco') or ''}")
+    ]
+    st.caption(f"Blocos de Clientes/Obras ({len(obras_visiveis)} de {len(obras)})")
+    for o in obras_visiveis:
+        selecionada = o["id"] == obra_id
+        st.button(
+            f"{ICONE_STATUS.get(o['status'], '')} {o['nome_cliente']} · {o['status']}",
+            key=f"sb_obra_{o['id']}",
+            type="primary" if selecionada else "secondary",
+            width="stretch",
+            on_click=selecionar_obra, args=(o["id"],),
+            help=o.get("endereco") or "Endereço não informado",
+        )
+    if obras and not obras_visiveis:
+        st.caption("Nenhum bloco encontrado.")
 
     st.divider()
     if security.pin_ativo():
         st.button("🔒 Bloquear acesso", on_click=security.logout, width="stretch",
                   help="Encerra o acesso neste aparelho. Será preciso digitar o PIN novamente.")
+    st.caption("Tema claro/escuro: menu ⋮ > Settings > Theme.")
     st.caption("ObraTrack AI · Diário de obra inteligente para reformas")
 
-
-# --------------------------------------------------------------------------- #
-# Tela principal: Blocos de Clientes
-# --------------------------------------------------------------------------- #
-st.title("🏗️ ObraTrack AI")
 
 if mensagem := st.session_state.pop("flash", None):
     st.toast(mensagem, icon="✅")
 
-obras = db.listar_obras()
-if not obras:
-    st.info("Nenhuma obra cadastrada. Use a barra lateral para criar o primeiro Bloco.")
+
+# --------------------------------------------------------------------------- #
+# Tela de boas-vindas (nenhum bloco selecionado)
+# --------------------------------------------------------------------------- #
+if obra_id is None:
+    st.title("🏗️ ObraTrack AI")
+    st.markdown("##### Diário de obra com IA: relato por voz, checklist por cômodo e documentação As-Built.")
+
+    with st.container(border=True):
+        st.subheader("➕ Cadastrar Novo Bloco de Cliente/Obra")
+        with st.form("form_nova_obra", clear_on_submit=True, enter_to_submit=False, border=False):
+            nome = st.text_input(
+                "Nome da Cliente / Obra *", placeholder="Ex.: Reforma Cozinha - Sra. Ana", max_chars=LIM_NOME,
+                help="Nome que identifica o bloco. Use o padrão 'Serviço - Cliente'.",
+            )
+            endereco = st.text_input(
+                "Endereço", placeholder="Rua, número - bairro", max_chars=LIM_ENDERECO,
+                help="Endereço da obra. Aparece no cabeçalho do bloco e no relatório do cliente.",
+            )
+            escopo = st.text_area(
+                "Escopo da Obra", placeholder="Serviços contratados", max_chars=LIM_ESCOPO,
+                help="Serviços, metragens e materiais contratados. Usado para avaliar a produtividade do dia.",
+            )
+            c_status, c_inicio = st.columns(2)
+            status = c_status.selectbox(
+                "Status", db.STATUS_OBRA, help="Situação atual da obra. Pode ser cadastrada já pausada ou concluída.",
+            )
+            inicio = c_inicio.date_input(
+                "Data de início", value=date.today(), format="DD/MM/YYYY",
+                help="Data em que a obra começou (ou começará).",
+            )
+            criar = st.form_submit_button("Cadastrar e abrir o bloco", type="primary", width="stretch")
+
+        if criar:
+            nome_limpo = sanitize_text(nome, LIM_NOME)
+            if not nome_limpo:
+                st.error("Informe o nome da cliente/obra.")
+            else:
+                novo_id = db.criar_obra(
+                    nome_limpo, sanitize_text(endereco, LIM_ENDERECO), sanitize_text(escopo, LIM_ESCOPO),
+                    status, inicio.isoformat(),
+                )
+                selecionar_obra(novo_id)  # abre o bloco recém-criado
+                flash(f"Bloco “{nome_limpo}” cadastrado.")
+                st.rerun()
+
+    if obras_visiveis:
+        st.subheader("Acesso rápido aos blocos", help="Toque em um bloco para abrir o diário daquela cliente.")
+        resumos = db.resumo_obras()
+        vazio = {"tarefas": 0, "concluidas": 0, "registros": 0}
+        colunas = st.columns(2)  # em telas estreitas o Streamlit empilha as colunas
+        for i, o in enumerate(obras_visiveis):
+            with colunas[i % 2]:
+                card_obra(o, resumos.get(o["id"], vazio), False, "inicio")
+    elif obras:
+        st.info("Nenhum bloco corresponde ao filtro da barra lateral.")
     st.stop()
 
-ids_validos = {o["id"] for o in obras}
-if st.session_state.get("obra_id") not in ids_validos:
-    st.session_state["obra_id"] = obras[0]["id"]
 
-resumos = db.resumo_obras()
-st.subheader("Blocos de Clientes/Obras", help="Toque em um bloco para abrir o diário daquela cliente.")
-colunas = st.columns(2)  # em telas estreitas o Streamlit empilha as colunas
-for i, o in enumerate(obras):
-    selecionada = o["id"] == st.session_state["obra_id"]
-    res = resumos.get(o["id"], {"tarefas": 0, "concluidas": 0, "registros": 0})
-    pct = res["concluidas"] / res["tarefas"] if res["tarefas"] else 0.0
-    chave = f"obra_card_ativo_{o['id']}" if selecionada else f"obra_card_{o['id']}"
-    with colunas[i % 2].container(border=True, key=chave):
-        st.markdown(
-            f"<div class='ot-card-titulo'>{esc(o['nome_cliente'], LIM_NOME)}</div>"
-            f"<div class='ot-card-sub'>📍 {esc(o.get('endereco') or 'Endereço não informado', LIM_ENDERECO)}</div>"
-            f"{badge_status(o['status'])}"
-            f"<div class='ot-barra' style='margin-top:.5rem'><div style='width:{pct * 100:.0f}%'></div></div>"
-            f"<div class='ot-card-meta'>{pct:.0%} concluído · {res['concluidas']}/{res['tarefas']} tarefas · "
-            f"{res['registros']} registro(s)</div>",
-            unsafe_allow_html=True,
-        )
-        if st.button(
-            "✔ Selecionado" if selecionada else "Abrir bloco",
-            key=f"abrir_{o['id']}",
-            type="primary" if selecionada else "secondary",
-            disabled=selecionada,
-            width="stretch",
-        ):
-            st.session_state["obra_id"] = o["id"]
-            st.rerun()
+# --------------------------------------------------------------------------- #
+# Bloco selecionado: cabeçalho
+# --------------------------------------------------------------------------- #
+obra = next(o for o in obras if o["id"] == obra_id)
+recomendados = db.listar_ambientes_recomendados(obra_id)
 
-obra = next(o for o in obras if o["id"] == st.session_state["obra_id"])
-obra_id = obra["id"]
-
-# Cabeçalho do bloco selecionado
-st.divider()
-c_titulo, c_gerenciar = st.columns([4, 1], vertical_alignment="center")
-c_titulo.header(obra["nome_cliente"])
+c_titulo, c_gerenciar = st.columns([5, 1], vertical_alignment="center")
+c_titulo.title(obra["nome_cliente"])
 with c_gerenciar.popover("⚙️", help="Editar ou excluir este bloco"):
     with st.form(f"form_edit_obra_{obra_id}", enter_to_submit=False, border=False):
         st.markdown("**Editar bloco**")
         e_nome = st.text_input("Nome da Cliente / Obra *", value=obra["nome_cliente"], max_chars=LIM_NOME,
-                               help="Nome exibido no card do bloco.")
+                               help="Nome exibido no bloco.")
         e_end = st.text_input("Endereço", value=obra.get("endereco") or "", max_chars=LIM_ENDERECO,
                               help="Endereço da obra.")
         e_escopo = st.text_area("Escopo da Obra", value=obra.get("escopo_resumo") or "", max_chars=LIM_ESCOPO,
@@ -671,11 +860,59 @@ if obra.get("escopo_resumo"):
 # Os KPIs são desenhados no fim do script, para já refletirem um registro recém-salvo.
 area_metricas = st.container()
 
+
+# --------------------------------------------------------------------------- #
+# Busca Global e Filtros Avançados (valem para checklist, histórico e galeria)
+# --------------------------------------------------------------------------- #
+chaves = _chaves_filtro(obra_id)
+busca_global = st.text_input(
+    "Busca global na obra",
+    placeholder="🔍 Pesquisar em tarefas, transcrições, canos, materiais ou atrasos...",
+    key=chaves["busca"], max_chars=LIM_BUSCA,
+    help="Filtra o checklist, o histórico e a galeria. Várias palavras: todas precisam aparecer. "
+    "Não diferencia maiúsculas nem acentos.",
+)
+ambientes_da_obra = list(dict.fromkeys(t["ambiente"] for t in db.listar_tarefas_obra(obra_id)))
+if chaves["ambientes"] in st.session_state:
+    # Remove da seleção ambientes que deixaram de existir (ex.: última tarefa excluída).
+    st.session_state[chaves["ambientes"]] = [a for a in st.session_state[chaves["ambientes"]] if a in ambientes_da_obra]
+
+filtros_abertos = any(
+    st.session_state.get(chaves[n]) for n in ("ambientes", "niveis", "datas", "atraso")
+) or st.session_state.get(chaves["status"]) not in (None, "Todas")
+with st.expander("⚙️ Filtros avançados", expanded=filtros_abertos):
+    c1, c2 = st.columns(2)
+    f_ambientes = c1.multiselect("Ambiente / Cômodo", ambientes_da_obra, key=chaves["ambientes"],
+                                 placeholder="Todos", help="Checklist, registros e fotos destes cômodos.")
+    f_status = c2.segmented_control("Status da tarefa", db.STATUS_TAREFA, default="Todas", key=chaves["status"],
+                                    help="Vale para o checklist.") or "Todas"
+    c3, c4 = st.columns(2)
+    f_niveis = c3.multiselect("Produtividade", NIVEIS, key=chaves["niveis"], placeholder="Todas",
+                              help="Registros (e tarefas extraídas deles) com estes níveis.")
+    f_datas = c4.date_input("Intervalo de datas", value=(), format="DD/MM/YYYY", key=chaves["datas"],
+                            help="Escolha a data inicial e a final. Uma só data filtra a partir dela.")
+    f_atraso = st.toggle("Apenas dias com atraso/imprevisto", key=chaves["atraso"],
+                         help="Somente registros com justificativa de atraso (chuva, faltas, material...).")
+    st.button("Limpar filtros", on_click=_limpar_filtros, args=(obra_id,), width="stretch")
+
+datas = tuple(f_datas) if isinstance(f_datas, (list, tuple)) else ((f_datas,) if f_datas else ())
+filtro = dict(
+    busca=sanitize_text(busca_global, LIM_BUSCA),
+    ambientes=f_ambientes or None,
+    niveis=f_niveis or None,
+    data_inicio=datas[0].isoformat() if datas else None,
+    data_fim=datas[1].isoformat() if len(datas) > 1 else None,
+    apenas_atraso=f_atraso,
+    texto_sem_atraso=SEM_ATRASO,
+)
+filtrando = bool(filtro["busca"] or f_ambientes or f_niveis or datas or f_atraso or f_status != "Todas")
+area_resultado_busca = st.empty()
+
 aba_registro, aba_checklist, aba_historico, aba_galeria = st.tabs([
     "🎙️ Novo Registro (Áudio/Foto)",
     "✅ Checklist de Tarefas (Por Ambiente)",
     "📋 Histórico e Diários (Editar/Excluir)",
-    "📐 Galeria As-Built & Relatório do Cliente",
+    "📐 Galeria As-Built & Relatório",
 ])
 
 
@@ -694,7 +931,8 @@ with aba_registro:
             "Adicionar foto da reforma / tubulação",
             type=["jpg", "jpeg", "png"],
             help="Fotografe a parede/piso ANTES do reboco ou revestimento, com uma referência de medida, "
-            "para documentar a posição das tubulações. A localização e os dados do celular são removidos da foto.",
+            "para documentar a posição das tubulações. A foto é compactada e a localização e os dados "
+            "do celular são removidos.",
         )
         c_obs, c_data = st.columns([2, 1])
         obs = c_obs.text_input(
@@ -714,6 +952,7 @@ with aba_registro:
     if enviar:
         obs = sanitize_text(obs, LIM_OBS)
         caminho_audio = caminho_foto = None
+        bytes_foto_original = None
         erros_midia: list[str] = []
         # Cada mídia é validada pelo conteúdo real e salva com nome aleatório (UUID).
         if audio:
@@ -723,7 +962,9 @@ with aba_registro:
                 erros_midia.append(f"Áudio recusado: {exc}")
         if foto_up:
             try:
-                caminho_foto = security.validate_and_save_media(foto_up.getvalue(), "image")
+                dados_foto = foto_up.getvalue()
+                caminho_foto = security.validate_and_save_media(dados_foto, "image")
+                bytes_foto_original = len(dados_foto)
             except MidiaInvalidaError as exc:
                 erros_midia.append(f"Foto recusada: {exc}")
 
@@ -757,6 +998,7 @@ with aba_registro:
                 data_registro=data_reg.isoformat(),
                 caminho_foto=caminho_foto,
                 caminho_audio=caminho_audio,
+                foto_bytes_original=bytes_foto_original,
                 **dados,
             )
             tarefas_novas = []
@@ -778,16 +1020,27 @@ with aba_registro:
                     "data_registro": data_reg.isoformat(),
                     "caminho_foto": str(caminho_foto) if caminho_foto else None,
                     "caminho_audio": str(caminho_audio) if caminho_audio else None,
+                    "foto_bytes_original": bytes_foto_original,
                     **dados,
                 },
                 tarefas=tarefas_novas,
             )
 
+# Dados completos (KPIs, relatórios, ZIP) e dados filtrados (listas na tela).
 registros = db.listar_registros_por_obra(obra_id)
 tarefas = db.listar_tarefas_obra(obra_id)
+registros_filtrados = db.buscar_registros(obra_id, **filtro) if filtrando else registros
+tarefas_filtradas = db.buscar_tarefas(obra_id, status=f_status, **filtro) if filtrando else tarefas
+mapa_tarefas = tarefas_por_registro(tarefas)
 
 if excluir_bloco:
     dialog_excluir_obra(obra, len(registros), len(tarefas))
+
+if filtrando:
+    area_resultado_busca.caption(
+        f"🔎 Filtro ativo: {len(tarefas_filtradas)} de {len(tarefas)} tarefa(s) · "
+        f"{len(registros_filtrados)} de {len(registros)} registro(s)."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -799,13 +1052,8 @@ with aba_checklist:
     with st.expander("➕ Adicionar tarefa", expanded=not tarefas):
         with st.form(f"form_nova_tarefa_{obra_id}", clear_on_submit=True, enter_to_submit=False, border=False):
             c_amb, c_desc = st.columns([1, 2])
-            ambientes_existentes = list(grupos)
-            opcoes_ambiente = ambientes_existentes + [a for a in AMBIENTES_SUGERIDOS if a not in ambientes_existentes]
-            nova_amb = c_amb.selectbox(
-                "Ambiente", opcoes_ambiente, index=None, placeholder="Escolha ou digite",
-                accept_new_options=True,
-                help="Cômodo ou área da obra. Escolha da lista ou digite um novo nome.",
-            )
+            with c_amb:
+                nova_amb = seletor_ambiente("Ambiente", recomendados)
             nova_desc = c_desc.text_input(
                 "Descrição", placeholder="Ex: Assentar porcelanato", max_chars=LIM_TAREFA,
                 help="Atividade curta e objetiva.",
@@ -832,31 +1080,10 @@ with aba_checklist:
             unsafe_allow_html=True,
         )
 
-        chave_amb = f"filtro_amb_{obra_id}"
-        opcoes_filtro_amb = [TODOS_AMBIENTES, *grupos]
-        if st.session_state.get(chave_amb) not in opcoes_filtro_amb:
-            st.session_state[chave_amb] = TODOS_AMBIENTES  # ambiente filtrado deixou de existir
-        f_status, f_amb = st.columns([3, 2], vertical_alignment="bottom")
-        filtro_status = f_status.segmented_control(
-            "Mostrar", FILTROS_STATUS, default="Todas", key=f"filtro_status_{obra_id}",
-            help="Filtra as tarefas pela situação.",
-        ) or "Todas"
-        filtro_amb = f_amb.selectbox("Ambiente", opcoes_filtro_amb, key=chave_amb,
-                                     help="Mostra só as tarefas de um cômodo.")
-
-        def passa_filtro(t: dict) -> bool:
-            if filtro_status == "Pendentes" and t["concluida"]:
-                return False
-            if filtro_status == "Concluídas" and not t["concluida"]:
-                return False
-            return filtro_amb == TODOS_AMBIENTES or t["ambiente"] == filtro_amb
-
-        algum_visivel = False
-        for ambiente, itens in grupos.items():
-            visiveis = [t for t in itens if passa_filtro(t)]
-            if not visiveis:
-                continue
-            algum_visivel = True
+        if not tarefas_filtradas:
+            st.info("Nenhuma tarefa com a busca/filtros atuais.")
+        for ambiente, visiveis in agrupar_por_ambiente(tarefas_filtradas).items():
+            itens = grupos.get(ambiente, visiveis)
             feitas = sum(t["concluida"] for t in itens)
             with st.container(border=True):
                 st.markdown(badge_ambiente(ambiente, feitas, len(itens)), unsafe_allow_html=True)
@@ -872,8 +1099,7 @@ with aba_checklist:
                         )
                         with st.popover("✏️ Editar", help="Alterar texto ou ambiente da tarefa"):
                             with st.form(f"form_edit_tarefa_{t['id']}", enter_to_submit=False, border=False):
-                                e_amb = st.text_input("Ambiente", value=t["ambiente"], max_chars=LIM_AMBIENTE,
-                                                      help="Cômodo ou área (ex.: Cozinha).")
+                                e_amb = seletor_ambiente("Ambiente", recomendados, atual=t["ambiente"])
                                 e_desc = st.text_input("Descrição", value=t["descricao"], max_chars=LIM_TAREFA,
                                                        help="Texto da tarefa.")
                                 if st.form_submit_button("💾 Salvar", type="primary", width="stretch"):
@@ -890,8 +1116,6 @@ with aba_checklist:
                             args=(t["id"], t["descricao"]),
                             help="Remover esta tarefa do checklist",
                         )
-        if not algum_visivel:
-            st.info("Nenhuma tarefa com esses filtros.")
 
 
 # --------------------------------------------------------------------------- #
@@ -900,14 +1124,10 @@ with aba_checklist:
 with aba_historico:
     if not registros:
         st.info("Nenhum registro ainda. Use a aba “Novo Registro” para criar o primeiro.")
-    else:
-        tarefas_por_registro: dict[int, list[dict]] = {}
-        for t in tarefas:
-            if t["registro_id"]:
-                tarefas_por_registro.setdefault(t["registro_id"], []).append(t)
-
-        for r in registros:  # já vem do mais recente para o mais antigo
-            card_registro(r, tarefas=tarefas_por_registro.get(r["id"]), com_acoes=True)
+    elif not registros_filtrados:
+        st.info("Nenhum registro com a busca/filtros atuais.")
+    for r in registros_filtrados:  # já vem do mais recente para o mais antigo
+        card_registro(r, tarefas=mapa_tarefas.get(r["id"]), com_acoes=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -919,19 +1139,65 @@ with aba_galeria:
         help="Fotos técnicas com a posição de canos, conduítes e fiação. Consulte antes de furar "
         "paredes ou pisos: funciona como manual de manutenção da obra.",
     )
-    fotos = registros_com_foto(registros)
-    if not fotos:
+    todas_fotos = registros_com_foto(registros)
+    fotos = [
+        (r, p, ambientes_do_registro(r, mapa_tarefas, recomendados))
+        for r, p in registros_com_foto(registros_filtrados)
+    ]
+    if not todas_fotos:
         st.info("Nenhuma foto técnica ainda. Envie fotos na aba “Novo Registro”, de preferência antes do reboco.")
     else:
+        g_amb, g_txt = st.columns([1, 2])
+        opcoes_amb_galeria = [TODOS_AMBIENTES, *dict.fromkeys(a for _, _, ambs in fotos for a in ambs)]
+        chave_g_amb = f"galeria_amb_{obra_id}"
+        if st.session_state.get(chave_g_amb) not in opcoes_amb_galeria:
+            st.session_state[chave_g_amb] = TODOS_AMBIENTES
+        amb_galeria = g_amb.selectbox("Ambiente", opcoes_amb_galeria, key=chave_g_amb,
+                                      help="Mostra só as fotos de um cômodo.")
+        termo_galeria = g_txt.text_input(
+            "Palavra-chave", placeholder="Ex.: água quente, conduíte, 30 cm", key=f"galeria_txt_{obra_id}",
+            max_chars=LIM_BUSCA, help="Procura na descrição técnica, no resumo do dia e nos ambientes da foto.",
+        )
+        palavras = db.normalizar_busca(sanitize_text(termo_galeria, LIM_BUSCA)).split()
+        fotos = [
+            (r, p, ambs) for r, p, ambs in fotos
+            if (amb_galeria == TODOS_AMBIENTES or amb_galeria in ambs)
+            and all(
+                w in db.normalizar_busca(f"{r.get('mapeamento_asbuilt') or ''} {r.get('resumo_executivo') or ''} {' '.join(ambs)}")
+                for w in palavras
+            )
+        ]
+        st.caption(f"{len(fotos)} de {len(todas_fotos)} foto(s)")
+        if not fotos:
+            st.info("Nenhuma foto com esses filtros.")
         grade = st.columns(2)
-        for i, (r, foto) in enumerate(fotos):
+        for i, (r, foto, ambs) in enumerate(fotos):
             with grade[i % 2].container(border=True):
                 st.image(str(foto), width="stretch")
                 st.markdown(
-                    f"<span class='ot-data'>📅 {esc(formatar_data(r['data_registro']))}</span>",
+                    f"<span class='ot-data'>📅 {esc(formatar_data(r['data_registro']))}</span><br>"
+                    + "".join(badge_ambiente(a) for a in ambs),
                     unsafe_allow_html=True,
                 )
-                st.markdown(f"**Mapeamento:** {r.get('mapeamento_asbuilt') or '-'}")
+                descricao = r.get("mapeamento_asbuilt") or "-"
+                st.markdown(f"**Mapeamento:** {descricao[:180]}{'…' if len(descricao) > 180 else ''}")
+                st.caption(info_tamanho(r, foto))
+                if st.button("🔍 Ampliar", key=f"ampliar_{r['id']}", width="stretch",
+                             help="Abre a foto em tamanho grande com a descrição técnica completa."):
+                    dialog_foto(r, foto, ambs)
+
+        st.download_button(
+            "📦 Baixar Todas as Fotos e Memorial As-Built (.ZIP)",
+            # Gerado só no clique: fotos renomeadas por data/ambiente + memorial descritivo.
+            data=partial(gerar_zip_asbuilt, obra, registros, tarefas),
+            file_name=f"asbuilt_obra_{obra_id}_{date.today():%Y%m%d}.zip",
+            mime="application/zip",
+            width="stretch",
+            type="primary",
+            on_click="ignore",
+            help="Todas as fotos do bloco (01_2026-11-12_Banheiro-Social.jpg...) e o "
+            "Memorial_Descritivo_AsBuilt.txt relacionando cada foto à descrição técnica, para a arquiteta.",
+        )
 
     st.divider()
     st.subheader(
@@ -947,7 +1213,6 @@ with aba_galeria:
         file_name=f"relatorio_obra_{obra_id}_{date.today():%Y%m%d}.html",
         mime="text/html",
         width="stretch",
-        type="primary",
         on_click="ignore",
         help="Arquivo único com checklist, justificativas e galeria As-Built. Abra no navegador e use "
         "Ctrl+P (ou Compartilhar > Imprimir no celular) para salvar em PDF.",

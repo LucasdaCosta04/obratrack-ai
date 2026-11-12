@@ -28,7 +28,10 @@ BASE_DIR = Path(__file__).resolve().parent
 UPLOADS_DIR = BASE_DIR / "uploads"
 
 TAMANHO_MAXIMO_BYTES = 15 * 1024 * 1024  # 15 MB por arquivo
-QUALIDADE_JPEG = 90
+# Fotos: lado máximo de 1600 px e JPEG qualidade 78. Ainda dá para ler bitola de cano e
+# trajeto de conduíte, e uma foto de 5-10 MB do celular cai para ~120-200 KB.
+LADO_MAXIMO_FOTO = 1600
+QUALIDADE_JPEG = 78
 
 LIMITE_TEXTO_PADRAO = 2_000
 LIMITE_TEXTO_LONGO = 20_000  # transcrições e textos gerados pela IA
@@ -64,8 +67,12 @@ def imagem_sem_metadados(img: Image.Image) -> Image.Image:
     return Image.frombytes("RGB", img.size, img.tobytes())
 
 
-def strip_image_exif(image_bytes: bytes) -> bytes:
-    """Regrava a imagem em memória como JPEG limpo, sem nenhum metadado (GPS, data, aparelho)."""
+def strip_image_exif(image_bytes: bytes, lado_maximo: int = LADO_MAXIMO_FOTO) -> bytes:
+    """Regrava a imagem como JPEG limpo e compacto.
+
+    Remove 100% dos metadados (GPS, data/hora, aparelho), reduz proporcionalmente para
+    caber em `lado_maximo` x `lado_maximo` (nunca amplia) e comprime (qualidade 78, optimize).
+    """
     try:
         with warnings.catch_warnings():
             # Imagem gigante (possível "decompression bomb") vira erro em vez de aviso.
@@ -73,6 +80,7 @@ def strip_image_exif(image_bytes: bytes) -> bytes:
             with Image.open(io.BytesIO(image_bytes)) as original:
                 original.load()
                 limpa = imagem_sem_metadados(original)
+                limpa.thumbnail((lado_maximo, lado_maximo), Image.Resampling.LANCZOS)
     except MidiaInvalidaError:
         raise
     except Exception as exc:
@@ -111,7 +119,7 @@ def validate_and_save_media(file_bytes: bytes, media_type: str) -> Path:
 
     `media_type` é "audio" (WAV, MP3 ou OGG) ou "image" (JPEG ou PNG). O tipo é decidido
     pelo conteúdo real do arquivo, nunca pelo nome ou extensão enviados. Fotos são salvas
-    sempre como JPEG sem metadados. Retorna o caminho relativo à pasta do projeto,
+    sempre como JPEG sem metadados, com no máximo 1600 px de lado. Retorna o caminho relativo à pasta do projeto,
     no formato gravado no banco (ex.: uploads\\3f2a...e1.jpg).
     """
     if media_type not in ("audio", "image"):

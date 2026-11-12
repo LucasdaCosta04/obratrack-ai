@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import unicodedata
 import warnings
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -17,6 +18,12 @@ GITIGNORE_PATH = BASE_DIR / ".gitignore"
 
 STATUS_OBRA = ("Em Andamento", "Pausada", "Concluída")
 NIVEIS_PRODUTIVIDADE = ("Baixa", "Média", "Alta")
+
+AMBIENTES_BASE = (
+    "Banheiro Social", "Banheiro Suíte", "Cozinha", "Sala", "Quarto",
+    "Área de Serviço", "Área Externa", "Hidráulica Geral", "Elétrica Geral",
+)
+STATUS_TAREFA = ("Todas", "Pendentes", "Concluídas")
 
 # Entradas que obrigatoriamente precisam estar no .gitignore (dados sensíveis).
 GITIGNORE_OBRIGATORIO = ("*.db", "*.db-wal", "*.db-shm", ".env", "uploads/")
@@ -84,6 +91,14 @@ def verificar_gitignore() -> list[str]:
     return [entrada for entrada in GITIGNORE_OBRIGATORIO if entrada not in linhas]
 
 
+def normalizar_busca(texto: object) -> str:
+    """Minúsculas e sem acentos, para comparar textos digitados no canteiro."""
+    if texto is None:
+        return ""
+    decomposto = unicodedata.normalize("NFKD", str(texto))
+    return "".join(c for c in decomposto if not unicodedata.combining(c)).casefold()
+
+
 @contextmanager
 def get_connection(db_path: Path = DB_PATH) -> Iterator[sqlite3.Connection]:
     """Abre uma conexão com FK e WAL habilitados, commit automático e fechamento garantido.
@@ -93,6 +108,8 @@ def get_connection(db_path: Path = DB_PATH) -> Iterator[sqlite3.Connection]:
     """
     conn = sqlite3.connect(str(validar_caminho_local(db_path)), timeout=10)
     conn.row_factory = sqlite3.Row
+    # norm(): busca sem diferenciar maiúsculas nem acentos ("ceramica" acha "Cerâmica").
+    conn.create_function("norm", 1, normalizar_busca, deterministic=True)
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.execute("PRAGMA journal_mode = WAL;")
     try:
@@ -143,6 +160,7 @@ def init_db() -> None:
                 mapeamento_asbuilt   TEXT,
                 caminho_foto         TEXT,
                 caminho_audio        TEXT,
+                foto_bytes_original  INTEGER,
                 FOREIGN KEY (obra_id) REFERENCES clientes_obras (id) ON DELETE CASCADE
             );
 
@@ -176,6 +194,9 @@ def _migrar(conn: sqlite3.Connection) -> None:
     colunas = {row["name"] for row in conn.execute("PRAGMA table_info(registros_diarios)")}
     if "caminho_audio" not in colunas:
         conn.execute("ALTER TABLE registros_diarios ADD COLUMN caminho_audio TEXT")
+    if "foto_bytes_original" not in colunas:
+        # Tamanho da foto como saiu do celular, para mostrar a economia da compressão.
+        conn.execute("ALTER TABLE registros_diarios ADD COLUMN foto_bytes_original INTEGER")
     _sanear_textos_legados(conn)
 
 
@@ -351,6 +372,7 @@ def inserir_registro(
     caminho_foto: Optional[str | Path] = None,
     caminho_audio: Optional[str | Path] = None,
     data_registro: Optional[str] = None,
+    foto_bytes_original: Optional[int] = None,
 ) -> int:
     """Insere um registro diário vinculado a uma obra e retorna o seu id."""
     _validar_nivel(nivel_produtividade)
@@ -367,8 +389,8 @@ def inserir_registro(
             INSERT INTO registros_diarios (
                 obra_id, data_registro, transcricao_audio, resumo_executivo,
                 nivel_produtividade, motivo_atraso, mapeamento_asbuilt,
-                caminho_foto, caminho_audio
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                caminho_foto, caminho_audio, foto_bytes_original
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 obra_id,
@@ -380,24 +402,95 @@ def inserir_registro(
                 mapeamento_asbuilt,
                 foto,
                 audio,
+                foto_bytes_original if foto else None,
             ),
         )
         return int(cur.lastrowid)
 
 
+_COLUNAS_REGISTRO = """r.id, r.obra_id, r.data_registro, r.transcricao_audio, r.resumo_executivo,
+                   r.nivel_produtividade, r.motivo_atraso, r.mapeamento_asbuilt,
+                   r.caminho_foto, r.caminho_audio, r.foto_bytes_original"""
+
+
 def listar_registros_por_obra(obra_id: int) -> list[dict]:
     """Retorna os registros diários de uma obra, do mais recente ao mais antigo."""
+    return buscar_registros(obra_id)
+
+
+def _like(texto: str) -> str:
+    """Padrão LIKE '%texto%' normalizado, com os curingas do usuário escapados."""
+    t = normalizar_busca(texto).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{t}%"
+
+
+def _termos(busca: Optional[str]) -> list[str]:
+    """Uma condição por palavra da busca (máx. 10): todas precisam aparecer."""
+    return [_like(p) for p in normalizar_busca(busca or "").split()[:10]]
+
+
+def _filtro_atraso(sem_atraso: str) -> tuple[str, list]:
+    return ("TRIM(COALESCE(r.motivo_atraso, '')) NOT IN ('', ?)", [sem_atraso])
+
+
+def buscar_registros(
+    obra_id: int,
+    busca: str = "",
+    ambientes: Optional[list[str]] = None,
+    niveis: Optional[list[str]] = None,
+    data_inicio: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    apenas_atraso: bool = False,
+    texto_sem_atraso: str = "",
+) -> list[dict]:
+    """Registros da obra que atendem a todos os filtros, do mais recente ao mais antigo.
+
+    - `busca`: cada palavra precisa aparecer na transcrição, resumo, atraso, As-Built
+      ou nas tarefas extraídas do registro (sem diferenciar maiúsculas nem acentos).
+    - `ambientes`: registros com tarefa nesses ambientes ou que os citam no texto.
+    - `apenas_atraso`: só dias com justificativa de atraso diferente de `texto_sem_atraso`.
+    """
+    where, params = ["r.obra_id = ?"], [obra_id]
+    textos = ("r.transcricao_audio", "r.resumo_executivo", "r.motivo_atraso", "r.mapeamento_asbuilt")
+    for termo in _termos(busca):
+        campos = " OR ".join(f"norm({c}) LIKE ? ESCAPE '\\'" for c in textos)
+        where.append(
+            f"""({campos} OR EXISTS (
+                    SELECT 1 FROM tarefas_obra t WHERE t.registro_id = r.id
+                    AND (norm(t.descricao) LIKE ? ESCAPE '\\' OR norm(t.ambiente) LIKE ? ESCAPE '\\')))"""
+        )
+        params += [termo] * (len(textos) + 2)
+    if ambientes:
+        marcas = ", ".join("?" * len(ambientes))
+        cita = " OR ".join(
+            "norm(r.mapeamento_asbuilt) LIKE ? ESCAPE '\\' OR norm(r.resumo_executivo) LIKE ? ESCAPE '\\'"
+            for _ in ambientes
+        )
+        where.append(
+            f"""(EXISTS (SELECT 1 FROM tarefas_obra t WHERE t.registro_id = r.id AND t.ambiente IN ({marcas}))
+                 OR {cita})"""
+        )
+        params += list(ambientes)
+        for a in ambientes:
+            params += [_like(a)] * 2
+    if niveis:
+        where.append(f"r.nivel_produtividade IN ({', '.join('?' * len(niveis))})")
+        params += list(niveis)
+    if data_inicio:
+        where.append("r.data_registro >= ?")
+        params.append(data_inicio)
+    if data_fim:
+        where.append("r.data_registro <= ?")
+        params.append(data_fim)
+    if apenas_atraso:
+        sql, p = _filtro_atraso(texto_sem_atraso)
+        where.append(sql)
+        params += p
     with get_connection() as conn:
         rows = conn.execute(
-            """
-            SELECT id, obra_id, data_registro, transcricao_audio, resumo_executivo,
-                   nivel_produtividade, motivo_atraso, mapeamento_asbuilt,
-                   caminho_foto, caminho_audio
-            FROM registros_diarios
-            WHERE obra_id = ?
-            ORDER BY data_registro DESC, id DESC
-            """,
-            (obra_id,),
+            f"SELECT {_COLUNAS_REGISTRO} FROM registros_diarios r WHERE {' AND '.join(where)} "
+            "ORDER BY r.data_registro DESC, r.id DESC",
+            params,
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -492,17 +585,92 @@ def inserir_tarefa(
 
 def listar_tarefas_obra(obra_id: int) -> list[dict]:
     """Tarefas da obra ordenadas por ambiente; pendentes antes das concluídas."""
+    return buscar_tarefas(obra_id)
+
+
+def buscar_tarefas(
+    obra_id: int,
+    busca: str = "",
+    ambientes: Optional[list[str]] = None,
+    status: str = "Todas",
+    niveis: Optional[list[str]] = None,
+    data_inicio: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    apenas_atraso: bool = False,
+    texto_sem_atraso: str = "",
+) -> list[dict]:
+    """Tarefas da obra que atendem a todos os filtros (por ambiente; pendentes primeiro).
+
+    A data de uma tarefa é a do registro de origem ou, se foi digitada à mão, a de criação.
+    Filtros de produtividade e atraso pertencem ao registro: com eles ativos, só entram
+    tarefas extraídas de registros que os atendem.
+    """
+    if status not in STATUS_TAREFA:
+        raise ValueError(f"Status de tarefa inválido: {status!r}. Use um de {STATUS_TAREFA}.")
+    where, params = ["t.obra_id = ?"], [obra_id]
+    for termo in _termos(busca):
+        where.append("(norm(t.descricao) LIKE ? ESCAPE '\\' OR norm(t.ambiente) LIKE ? ESCAPE '\\')")
+        params += [termo, termo]
+    if ambientes:
+        where.append(f"t.ambiente IN ({', '.join('?' * len(ambientes))})")
+        params += list(ambientes)
+    if status != "Todas":
+        where.append("t.concluida = ?")
+        params.append(1 if status == "Concluídas" else 0)
+    data_tarefa = "COALESCE(r.data_registro, substr(t.data_criacao, 1, 10))"
+    if data_inicio:
+        where.append(f"{data_tarefa} >= ?")
+        params.append(data_inicio)
+    if data_fim:
+        where.append(f"{data_tarefa} <= ?")
+        params.append(data_fim)
+    if niveis:
+        where.append(f"r.nivel_produtividade IN ({', '.join('?' * len(niveis))})")
+        params += list(niveis)
+    if apenas_atraso:
+        sql, p = _filtro_atraso(texto_sem_atraso)
+        where.append(f"r.id IS NOT NULL AND {sql}")
+        params += p
     with get_connection() as conn:
         rows = conn.execute(
-            """
-            SELECT id, obra_id, registro_id, ambiente, descricao, concluida, data_criacao
-            FROM tarefas_obra
-            WHERE obra_id = ?
-            ORDER BY ambiente COLLATE NOCASE, concluida, id
+            f"""
+            SELECT t.id, t.obra_id, t.registro_id, t.ambiente, t.descricao, t.concluida, t.data_criacao
+            FROM tarefas_obra t
+            LEFT JOIN registros_diarios r ON r.id = t.registro_id
+            WHERE {' AND '.join(where)}
+            ORDER BY t.ambiente COLLATE NOCASE, t.concluida, t.id
             """,
-            (obra_id,),
+            params,
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def listar_ambientes_recomendados(obra_id: Optional[int] = None) -> list[str]:
+    """Ambientes sugeridos, aprendendo com o histórico de tarefas.
+
+    Ordem: ambientes já usados nesta obra (mais frequentes primeiro), depois os usados
+    nas demais obras (aprendidos dos áudios ou digitados à mão) e, por fim, os ambientes
+    base. Sem duplicatas, ignorando maiúsculas e acentos.
+    """
+    with get_connection() as conn:
+        globais = conn.execute(
+            "SELECT ambiente, COUNT(*) AS freq FROM tarefas_obra GROUP BY ambiente ORDER BY freq DESC, ambiente"
+        ).fetchall()
+        da_obra = (
+            conn.execute(
+                "SELECT ambiente, COUNT(*) AS freq FROM tarefas_obra WHERE obra_id = ? "
+                "GROUP BY ambiente ORDER BY freq DESC, ambiente",
+                (obra_id,),
+            ).fetchall()
+            if obra_id is not None
+            else []
+        )
+    recomendados: dict[str, str] = {}
+    for nome in [r["ambiente"] for r in da_obra] + [r["ambiente"] for r in globais] + list(AMBIENTES_BASE):
+        nome = (nome or "").strip()
+        if nome and normalizar_busca(nome) not in recomendados:
+            recomendados[normalizar_busca(nome)] = nome
+    return list(recomendados.values())
 
 
 def alternar_status_tarefa(tarefa_id: int, concluida: int | bool) -> bool:

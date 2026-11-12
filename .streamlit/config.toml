@@ -1,6 +1,7 @@
 [client]
-# Esconde o menu técnico do Streamlit (rerun, configurações, "Deploy") para o usuário final.
-toolbarMode = "minimal"
+# "viewer": esconde as opções de desenvolvedor (Rerun, Clear cache, Deploy), mas mantém
+# o menu ⋮ > Settings, onde o usuário escolhe o tema claro ou escuro.
+toolbarMode = "viewer"
 # Erros inesperados não exibem traceback nem caminhos do servidor na tela.
 showErrorDetails = "none"
 
@@ -14,6 +15,24 @@ enableXsrfProtection = true
 gatherUsageStats = false
 
 [theme]
-# Tema claro fixo: mais legível sob sol no canteiro e consistente com os cards executivos.
-base = "light"
+# Escuro por padrão: menos reflexo e menos bateria no celular do canteiro.
+base = "dark"
+primaryColor = "#3b82f6"
+
+# Paleta escura executiva: grafite azulado, sem preto puro, texto levemente quente.
+[theme.dark]
+primaryColor = "#3b82f6"
+backgroundColor = "#0f172a"
+secondaryBackgroundColor = "#1e293b"
+textColor = "#e2e8f0"
+
+[theme.dark.sidebar]
+backgroundColor = "#111c33"
+secondaryBackgroundColor = "#1e293b"
+
+# Paleta clara (Settings > Theme), boa para ler sob sol forte.
+[theme.light]
 primaryColor = "#1d4ed8"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f1f5f9"
+textColor = "#0f172a"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import unicodedata
 import warnings
@@ -99,6 +100,129 @@ def normalizar_busca(texto: object) -> str:
     return "".join(c for c in decomposto if not unicodedata.combining(c)).casefold()
 
 
+def corresponde_busca(busca: Optional[str], *campos: object) -> bool:
+    """True se TODAS as palavras da busca aparecem em algum dos campos (sem acentos/maiúsculas).
+
+    Ex.: corresponde_busca("ceramica banheiro", "Retirada da cerâmica", "Banheiro Social") -> True.
+    """
+    termos = normalizar_busca(busca or "").split()[:10]
+    if not termos:
+        return True
+    alvo = " ".join(normalizar_busca(c) for c in campos if c)
+    return all(t in alvo for t in termos)
+
+
+# --------------------------------------------------------------------------- #
+# Detecção de ambiente (cômodo) por palavras-chave
+# Usada pela análise offline, pela correção da saída da IA e pela migração das fotos.
+# --------------------------------------------------------------------------- #
+# Ordem importa: do mais específico para o mais genérico. Regex sobre texto normalizado.
+_REGRAS_AMBIENTE: list[tuple[str, str]] = [
+    (r"banheiro\s+(?:da\s+|do\s+)?suite|\bsuite\b", "Banheiro Suíte"),
+    (r"banheiro\s+social", "Banheiro Social"),
+    (r"\blavabo", "Lavabo"),
+    (r"\bbanheiro|\bwc\b|\bchuveiro|vaso\s+sanitario|\bprivada|\bbox\b", "Banheiro"),
+    (r"\bcozinha", "Cozinha"),
+    (r"area\s+de\s+servico|lavanderia|\btanque\b", "Área de Serviço"),
+    (r"\bsala\b", "Sala"),
+    (r"\bquartos?\b|dormitorio", "Quarto"),
+    (r"\bvaranda|\bsacada", "Varanda"),
+    (r"\bgaragem", "Garagem"),
+    (r"\bfachada", "Fachada"),
+    (r"\bmuros?\b", "Muro"),
+    (r"\bcalcada", "Calçada"),
+    (r"\btelhado|\blaje\b|\bcobertura\b", "Cobertura"),
+    (r"area\s+externa|\bquintal|\bjardim|\bfossas?\b|\bvalas?\b|sumidouro", "Área Externa"),
+]
+AMBIENTES_EXTERNOS = frozenset({"Área Externa", "Muro", "Calçada", "Fachada", "Cobertura", "Garagem"})
+# Ambientes "coringa" que a IA às vezes usa quando não entende o cômodo.
+_AMBIENTES_GENERICOS = frozenset(
+    normalizar_busca(a) for a in ("", "Geral", "Obra", "Área Externa", "Externa", "Externo",
+                                  "Hidráulica Geral", "Elétrica Geral", "Não informado")
+)
+# Serviços tipicamente internos: com eles, o ambiente nunca deve ser "Área Externa".
+_SERVICO_INTERNO = re.compile(
+    r"\bceramica|\bazulej|\bpiso\b|porcelanato|revestimento|rejunt|\bcanos?\b|\btubo|tubulac|hidraulic|"
+    r"\besgoto|\bralo|\bloucas?\b|\bpia\b|torneira|\bgesso|\bforro|\breboco|\btomadas?\b|interruptor|"
+    r"\bfios?\b|fiacao|conduite|\bbancada|\bregistro\s+de\s+agua"
+)
+_SERVICO_HIDRAULICO = re.compile(r"\bcanos?\b|\btubo|tubulac|hidraulic|\besgoto|\bralo|registro\s+de\s+agua")
+_SERVICO_ELETRICO = re.compile(r"\btomadas?\b|interruptor|\bfios?\b|fiacao|conduite|disjuntor|eletric")
+
+
+def ambientes_citados(texto: object) -> list[str]:
+    """Ambientes citados no texto, na ordem em que aparecem (sem repetição)."""
+    alvo = normalizar_busca(texto)
+    achados: list[tuple[int, str]] = []
+    ocupado: list[tuple[int, int]] = []
+    for padrao, nome in _REGRAS_AMBIENTE:
+        for m in re.finditer(padrao, alvo):
+            # Um trecho já reconhecido por regra mais específica não conta de novo
+            # ("banheiro social" não vira também "Banheiro").
+            if any(m.start() < fim and m.end() > ini for ini, fim in ocupado):
+                continue
+            ocupado.append((m.start(), m.end()))
+            achados.append((m.start(), nome))
+    return list(dict.fromkeys(nome for _, nome in sorted(achados)))
+
+
+def _mesmo_ambiente(a: str, b: str) -> bool:
+    na, nb = normalizar_busca(a), normalizar_busca(b)
+    return bool(na and nb) and (na in nb or nb in na)
+
+
+def detectar_ambiente(texto: object, contexto: object = "", padrao: str = "Geral") -> str:
+    """Ambiente de uma atividade a partir do texto e, se preciso, do escopo da obra.
+
+    1) cômodo citado no próprio texto ("cerâmica do banheiro" -> Banheiro);
+    2) serviço interno sem cômodo (cerâmica, piso, cano...) -> cômodo do contexto/escopo;
+    3) hidráulica/elétrica sem cômodo -> "Hidráulica Geral" / "Elétrica Geral";
+    4) caso contrário, `padrao`.
+    """
+    citados = ambientes_citados(texto)
+    if citados:
+        return citados[0]
+    alvo = normalizar_busca(texto)
+    if _SERVICO_INTERNO.search(alvo):
+        internos = [a for a in ambientes_citados(contexto) if a not in AMBIENTES_EXTERNOS]
+        if internos:
+            return internos[0]
+        if _SERVICO_HIDRAULICO.search(alvo):
+            return "Hidráulica Geral"
+        if _SERVICO_ELETRICO.search(alvo):
+            return "Elétrica Geral"
+    return padrao
+
+
+def corrigir_ambiente(ambiente: Optional[str], descricao: object, relato: object = "", contexto: object = "") -> str:
+    """Corrige o ambiente sugerido (pela IA ou por regra) com base nas palavras-chave.
+
+    - Se a descrição da atividade cita um cômodo, ele prevalece ("Retirada da cerâmica do
+      banheiro" nunca fica em "Área Externa").
+    - Se o ambiente é genérico (Geral, Área Externa, Hidráulica Geral...) e a atividade é um
+      serviço interno (cerâmica, piso, cano...), usa o cômodo citado no relato do dia ou,
+      sem cômodo no relato, o do escopo da obra.
+    """
+    ambiente = (ambiente or "").strip()
+    desc = normalizar_busca(descricao)
+    citados = ambientes_citados(descricao)
+    if citados:
+        return ambiente if ambiente and _mesmo_ambiente(ambiente, citados[0]) else citados[0]
+    if normalizar_busca(ambiente) in _AMBIENTES_GENERICOS:
+        interno = bool(_SERVICO_INTERNO.search(desc))
+        coringa = normalizar_busca(ambiente) in {"", "geral", "obra", "area externa", "externa", "externo"}
+        if interno or coringa:
+            do_relato = [a for a in ambientes_citados(relato) if a not in AMBIENTES_EXTERNOS]
+            # Vários cômodos no relato: só decide por um deles se o ambiente atual for coringa.
+            if len(do_relato) == 1 or (interno and coringa and do_relato):
+                return do_relato[0]
+            if interno:
+                sugerido = detectar_ambiente(descricao, contexto, padrao=ambiente or "Geral")
+                if sugerido != "Área Externa":
+                    return sugerido
+    return ambiente or "Geral"
+
+
 @contextmanager
 def get_connection(db_path: Path = DB_PATH) -> Iterator[sqlite3.Connection]:
     """Abre uma conexão com FK e WAL habilitados, commit automático e fechamento garantido.
@@ -183,6 +307,28 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_tarefas_obra_id ON tarefas_obra (obra_id);
             CREATE INDEX IF NOT EXISTS idx_tarefas_registro_id ON tarefas_obra (registro_id);
+
+            -- Fotos da obra vinculadas a ambiente, serviço e (opcionalmente) registro/tarefa.
+            -- Um registro ou tarefa pode ter várias fotos. Excluir a tarefa só desvincula a foto.
+            CREATE TABLE IF NOT EXISTS midias_obra (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                obra_id              INTEGER NOT NULL,
+                registro_id          INTEGER,
+                tarefa_id            INTEGER,
+                ambiente             TEXT NOT NULL DEFAULT 'Geral',
+                titulo_servico       TEXT,
+                descricao_tecnica    TEXT,
+                caminho_foto         TEXT NOT NULL,
+                data_midia           TEXT NOT NULL,
+                foto_bytes_original  INTEGER,
+                FOREIGN KEY (obra_id) REFERENCES clientes_obras (id) ON DELETE CASCADE,
+                FOREIGN KEY (registro_id) REFERENCES registros_diarios (id) ON DELETE SET NULL,
+                FOREIGN KEY (tarefa_id) REFERENCES tarefas_obra (id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_midias_obra_id ON midias_obra (obra_id);
+            CREATE INDEX IF NOT EXISTS idx_midias_registro_id ON midias_obra (registro_id);
+            CREATE INDEX IF NOT EXISTS idx_midias_tarefa_id ON midias_obra (tarefa_id);
             """
         )
         _migrar(conn)
@@ -198,6 +344,53 @@ def _migrar(conn: sqlite3.Connection) -> None:
         # Tamanho da foto como saiu do celular, para mostrar a economia da compressão.
         conn.execute("ALTER TABLE registros_diarios ADD COLUMN foto_bytes_original INTEGER")
     _sanear_textos_legados(conn)
+    _migrar_fotos_para_midias(conn)
+
+
+def _migrar_fotos_para_midias(conn: sqlite3.Connection) -> int:
+    """Copia para `midias_obra` as fotos de registros antigos que ainda não estão lá.
+
+    O ambiente vem das tarefas extraídas do registro; se elas forem genéricas ("Área
+    Externa"/"Geral") e o texto do dia citar um cômodo interno (banheiro, cozinha...),
+    vale o cômodo do texto. Sem tarefas, usa o texto do registro e o escopo da obra.
+    Idempotente: a foto é identificada pelo caminho do arquivo.
+    """
+    pendentes = conn.execute(
+        """
+        SELECT r.id, r.obra_id, r.data_registro, r.transcricao_audio, r.resumo_executivo,
+               r.mapeamento_asbuilt, r.caminho_foto, r.foto_bytes_original, o.escopo_resumo
+        FROM registros_diarios r
+        JOIN clientes_obras o ON o.id = r.obra_id
+        WHERE r.caminho_foto IS NOT NULL AND TRIM(r.caminho_foto) <> ''
+          AND NOT EXISTS (SELECT 1 FROM midias_obra m WHERE m.caminho_foto = r.caminho_foto)
+        """
+    ).fetchall()
+    for r in pendentes:
+        texto = " ".join(filter(None, (r["transcricao_audio"], r["resumo_executivo"], r["mapeamento_asbuilt"])))
+        tarefas = conn.execute(
+            "SELECT id, ambiente, descricao, concluida FROM tarefas_obra WHERE registro_id = ? "
+            "ORDER BY concluida DESC, id",
+            (r["id"],),
+        ).fetchall()
+        if tarefas:
+            tarefa = tarefas[0]
+            ambiente = corrigir_ambiente(tarefa["ambiente"], tarefa["descricao"], texto, r["escopo_resumo"])
+            titulo, tarefa_id = tarefa["descricao"], tarefa["id"]
+        else:
+            ambiente = detectar_ambiente(texto, r["escopo_resumo"])
+            if ambiente in ("Geral", "Área Externa"):
+                ambiente = corrigir_ambiente(ambiente, texto, texto, r["escopo_resumo"])
+            titulo, tarefa_id = (r["resumo_executivo"] or "Registro fotográfico do dia")[:120], None
+        conn.execute(
+            """
+            INSERT INTO midias_obra (obra_id, registro_id, tarefa_id, ambiente, titulo_servico,
+                                     descricao_tecnica, caminho_foto, data_midia, foto_bytes_original)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (r["obra_id"], r["id"], tarefa_id, ambiente, titulo, r["mapeamento_asbuilt"] or "",
+             r["caminho_foto"], r["data_registro"], r["foto_bytes_original"]),
+        )
+    return len(pendentes)
 
 
 # Frases geradas pelo antigo "Modo Demonstração" que expunham detalhes técnicos ao usuário.
@@ -251,8 +444,12 @@ def _remover_midias_orfas(conn: sqlite3.Connection, caminhos: list[Optional[str]
     removidos = 0
     for caminho in {c for c in caminhos if c}:
         ainda_usado = conn.execute(
-            "SELECT 1 FROM registros_diarios WHERE caminho_foto = ? OR caminho_audio = ? LIMIT 1",
-            (caminho, caminho),
+            """
+            SELECT 1 FROM registros_diarios WHERE caminho_foto = ? OR caminho_audio = ?
+            UNION ALL SELECT 1 FROM midias_obra WHERE caminho_foto = ?
+            LIMIT 1
+            """,
+            (caminho, caminho, caminho),
         ).fetchone()
         arquivo = caminho_midia_seguro(caminho)
         if ainda_usado or arquivo is None or not arquivo.is_file():
@@ -349,8 +546,9 @@ def excluir_obra(obra_id: int) -> bool:
                 "SELECT caminho_foto, caminho_audio FROM registros_diarios WHERE obra_id = ?", (obra_id,)
             )
             for c in (row["caminho_foto"], row["caminho_audio"])
-        ]
+        ] + [row["caminho_foto"] for row in conn.execute("SELECT caminho_foto FROM midias_obra WHERE obra_id = ?", (obra_id,))]
         # Exclusão explícita (não depende de ON DELETE CASCADE em bancos antigos).
+        conn.execute("DELETE FROM midias_obra WHERE obra_id = ?", (obra_id,))
         conn.execute("DELETE FROM tarefas_obra WHERE obra_id = ?", (obra_id,))
         conn.execute("DELETE FROM registros_diarios WHERE obra_id = ?", (obra_id,))
         cur = conn.execute("DELETE FROM clientes_obras WHERE id = ?", (obra_id,))
@@ -457,9 +655,12 @@ def buscar_registros(
         where.append(
             f"""({campos} OR EXISTS (
                     SELECT 1 FROM tarefas_obra t WHERE t.registro_id = r.id
-                    AND (norm(t.descricao) LIKE ? ESCAPE '\\' OR norm(t.ambiente) LIKE ? ESCAPE '\\')))"""
+                    AND (norm(t.descricao) LIKE ? ESCAPE '\\' OR norm(t.ambiente) LIKE ? ESCAPE '\\'))
+                 OR EXISTS (
+                    SELECT 1 FROM midias_obra m WHERE m.registro_id = r.id
+                    AND (norm(m.titulo_servico) LIKE ? ESCAPE '\\' OR norm(m.ambiente) LIKE ? ESCAPE '\\')))"""
         )
-        params += [termo] * (len(textos) + 2)
+        params += [termo] * (len(textos) + 4)
     if ambientes:
         marcas = ", ".join("?" * len(ambientes))
         cita = " OR ".join(
@@ -527,11 +728,12 @@ def atualizar_registro_diario(
         return cur.rowcount > 0
 
 
-def excluir_registro_diario(registro_id: int, excluir_tarefas: bool = False) -> bool:
+def excluir_registro_diario(registro_id: int, excluir_tarefas: bool = False, excluir_fotos: bool = False) -> bool:
     """Exclui um registro diário e apaga com segurança suas mídias órfãs em uploads\\.
 
-    Tarefas extraídas desse registro são excluídas (`excluir_tarefas=True`) ou mantidas
-    no checklist, desvinculadas (padrão). Retorna False se o registro não existir.
+    Tarefas e fotos da galeria vindas desse registro são excluídas (`excluir_tarefas` /
+    `excluir_fotos`) ou mantidas na obra, desvinculadas (padrão). O áudio é sempre apagado.
+    Retorna False se o registro não existir.
     """
     with get_connection() as conn:
         row = conn.execute(
@@ -539,12 +741,21 @@ def excluir_registro_diario(registro_id: int, excluir_tarefas: bool = False) -> 
         ).fetchone()
         if row is None:
             return False
+        caminhos = [row["caminho_foto"], row["caminho_audio"]]
+        if excluir_fotos:
+            caminhos += [m["caminho_foto"] for m in conn.execute(
+                "SELECT caminho_foto FROM midias_obra WHERE registro_id = ?", (registro_id,))]
+            conn.execute("DELETE FROM midias_obra WHERE registro_id = ?", (registro_id,))
+        else:
+            conn.execute("UPDATE midias_obra SET registro_id = NULL WHERE registro_id = ?", (registro_id,))
         if excluir_tarefas:
+            conn.execute("UPDATE midias_obra SET tarefa_id = NULL WHERE tarefa_id IN "
+                         "(SELECT id FROM tarefas_obra WHERE registro_id = ?)", (registro_id,))
             conn.execute("DELETE FROM tarefas_obra WHERE registro_id = ?", (registro_id,))
         else:
             conn.execute("UPDATE tarefas_obra SET registro_id = NULL WHERE registro_id = ?", (registro_id,))
         conn.execute("DELETE FROM registros_diarios WHERE id = ?", (registro_id,))
-        _remover_midias_orfas(conn, [row["caminho_foto"], row["caminho_audio"]])
+        _remover_midias_orfas(conn, caminhos)
         return True
 
 
@@ -608,9 +819,17 @@ def buscar_tarefas(
     if status not in STATUS_TAREFA:
         raise ValueError(f"Status de tarefa inválido: {status!r}. Use um de {STATUS_TAREFA}.")
     where, params = ["t.obra_id = ?"], [obra_id]
+    # Cada palavra pode estar na tarefa, no relato do dia que a originou (transcrição/resumo)
+    # ou no título do serviço das fotos vinculadas a ela.
+    campos_busca = ("t.descricao", "t.ambiente", "r.transcricao_audio", "r.resumo_executivo")
     for termo in _termos(busca):
-        where.append("(norm(t.descricao) LIKE ? ESCAPE '\\' OR norm(t.ambiente) LIKE ? ESCAPE '\\')")
-        params += [termo, termo]
+        campos = " OR ".join(f"norm({c}) LIKE ? ESCAPE '\\'" for c in campos_busca)
+        where.append(
+            f"""({campos} OR EXISTS (
+                    SELECT 1 FROM midias_obra m WHERE m.tarefa_id = t.id
+                    AND norm(m.titulo_servico) LIKE ? ESCAPE '\\'))"""
+        )
+        params += [termo] * (len(campos_busca) + 1)
     if ambientes:
         where.append(f"t.ambiente IN ({', '.join('?' * len(ambientes))})")
         params += list(ambientes)
@@ -652,13 +871,14 @@ def listar_ambientes_recomendados(obra_id: Optional[int] = None) -> list[str]:
     nas demais obras (aprendidos dos áudios ou digitados à mão) e, por fim, os ambientes
     base. Sem duplicatas, ignorando maiúsculas e acentos.
     """
+    usados = "SELECT obra_id, ambiente FROM tarefas_obra UNION ALL SELECT obra_id, ambiente FROM midias_obra"
     with get_connection() as conn:
         globais = conn.execute(
-            "SELECT ambiente, COUNT(*) AS freq FROM tarefas_obra GROUP BY ambiente ORDER BY freq DESC, ambiente"
+            f"SELECT ambiente, COUNT(*) AS freq FROM ({usados}) GROUP BY ambiente ORDER BY freq DESC, ambiente"
         ).fetchall()
         da_obra = (
             conn.execute(
-                "SELECT ambiente, COUNT(*) AS freq FROM tarefas_obra WHERE obra_id = ? "
+                f"SELECT ambiente, COUNT(*) AS freq FROM ({usados}) WHERE obra_id = ? "
                 "GROUP BY ambiente ORDER BY freq DESC, ambiente",
                 (obra_id,),
             ).fetchall()
@@ -683,22 +903,128 @@ def alternar_status_tarefa(tarefa_id: int, concluida: int | bool) -> bool:
 
 
 def editar_tarefa(tarefa_id: int, ambiente: str, descricao: str) -> bool:
-    """Altera ambiente e descrição de uma tarefa. False se não existir."""
+    """Altera ambiente e descrição de uma tarefa. False se não existir.
+
+    As fotos vinculadas à tarefa que estavam no ambiente antigo acompanham a mudança
+    (ex.: tarefa corrigida de "Área Externa" para "Banheiro" leva suas fotos junto).
+    """
     if not descricao or not descricao.strip():
         raise ValueError("A descrição da tarefa é obrigatória.")
+    novo = _normalizar_ambiente(ambiente)
+    with get_connection() as conn:
+        antigo = conn.execute("SELECT ambiente FROM tarefas_obra WHERE id = ?", (tarefa_id,)).fetchone()
+        if antigo is None:
+            return False
+        conn.execute(
+            "UPDATE tarefas_obra SET ambiente = ?, descricao = ? WHERE id = ?",
+            (novo, descricao.strip(), tarefa_id),
+        )
+        conn.execute(
+            "UPDATE midias_obra SET ambiente = ? WHERE tarefa_id = ? AND ambiente = ?",
+            (novo, tarefa_id, antigo["ambiente"]),
+        )
+        return True
+
+
+def excluir_tarefa(tarefa_id: int) -> bool:
+    """Exclui uma tarefa do checklist (as fotos dela continuam na galeria). False se não existir."""
+    with get_connection() as conn:
+        conn.execute("UPDATE midias_obra SET tarefa_id = NULL WHERE tarefa_id = ?", (tarefa_id,))
+        cur = conn.execute("DELETE FROM tarefas_obra WHERE id = ?", (tarefa_id,))
+        return cur.rowcount > 0
+
+
+# --------------------------------------------------------------------------- #
+# Fotos da obra (galeria por ambiente e serviço)
+# --------------------------------------------------------------------------- #
+def inserir_midia_obra(
+    obra_id: int,
+    caminho_foto: str | Path,
+    ambiente: str,
+    titulo_servico: str = "",
+    descricao_tecnica: str = "",
+    registro_id: Optional[int] = None,
+    tarefa_id: Optional[int] = None,
+    data_midia: Optional[str] = None,
+    foto_bytes_original: Optional[int] = None,
+) -> int:
+    """Vincula uma foto (já salva em uploads\\) à obra, a um ambiente e, opcionalmente, a um
+    registro diário e/ou tarefa. Retorna o id da mídia."""
+    if caminho_midia_seguro(caminho_foto) is None:
+        raise CaminhoInseguroError(f"Caminho de foto fora da pasta uploads: {caminho_foto}")
     with get_connection() as conn:
         cur = conn.execute(
-            "UPDATE tarefas_obra SET ambiente = ?, descricao = ? WHERE id = ?",
-            (_normalizar_ambiente(ambiente), descricao.strip(), tarefa_id),
+            """
+            INSERT INTO midias_obra (obra_id, registro_id, tarefa_id, ambiente, titulo_servico,
+                                     descricao_tecnica, caminho_foto, data_midia, foto_bytes_original)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                obra_id, registro_id, tarefa_id, _normalizar_ambiente(ambiente),
+                (titulo_servico or "").strip(), (descricao_tecnica or "").strip(),
+                str(Path(caminho_foto)), data_midia or date.today().isoformat(), foto_bytes_original,
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def listar_midias_obra(obra_id: int, registro_id: Optional[int] = None, tarefa_id: Optional[int] = None) -> list[dict]:
+    """Fotos da obra (opcionalmente só de um registro ou tarefa), por ambiente e data.
+
+    Inclui dados da tarefa e do registro vinculados, para busca e exibição.
+    """
+    where, params = ["m.obra_id = ?"], [obra_id]
+    if registro_id is not None:
+        where.append("m.registro_id = ?")
+        params.append(registro_id)
+    if tarefa_id is not None:
+        where.append("m.tarefa_id = ?")
+        params.append(tarefa_id)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT m.id, m.obra_id, m.registro_id, m.tarefa_id, m.ambiente, m.titulo_servico,
+                   m.descricao_tecnica, m.caminho_foto, m.data_midia, m.foto_bytes_original,
+                   t.descricao AS tarefa_descricao, t.concluida AS tarefa_concluida,
+                   r.transcricao_audio, r.resumo_executivo, r.nivel_produtividade, r.motivo_atraso
+            FROM midias_obra m
+            LEFT JOIN tarefas_obra t ON t.id = m.tarefa_id
+            LEFT JOIN registros_diarios r ON r.id = m.registro_id
+            WHERE {' AND '.join(where)}
+            ORDER BY m.ambiente COLLATE NOCASE, m.data_midia DESC, m.id
+            """,
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def editar_midia_obra(midia_id: int, ambiente: str, titulo_servico: str, descricao_tecnica: str) -> bool:
+    """Altera ambiente, título do serviço e descrição técnica de uma foto. False se não existir."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE midias_obra SET ambiente = ?, titulo_servico = ?, descricao_tecnica = ? WHERE id = ?",
+            (_normalizar_ambiente(ambiente), (titulo_servico or "").strip(), (descricao_tecnica or "").strip(), midia_id),
         )
         return cur.rowcount > 0
 
 
-def excluir_tarefa(tarefa_id: int) -> bool:
-    """Exclui uma tarefa do checklist. False se não existir."""
+def excluir_midia_obra(midia_id: int) -> bool:
+    """Exclui a foto da galeria e apaga o arquivo de uploads\\ se nada mais o usar.
+
+    Para fotos migradas de registros antigos, também desvincula a foto do registro
+    (senão a migração a recolocaria na galeria no próximo início).
+    """
     with get_connection() as conn:
-        cur = conn.execute("DELETE FROM tarefas_obra WHERE id = ?", (tarefa_id,))
-        return cur.rowcount > 0
+        row = conn.execute("SELECT caminho_foto FROM midias_obra WHERE id = ?", (midia_id,)).fetchone()
+        if row is None:
+            return False
+        conn.execute("DELETE FROM midias_obra WHERE id = ?", (midia_id,))
+        conn.execute(
+            "UPDATE registros_diarios SET caminho_foto = NULL, foto_bytes_original = NULL WHERE caminho_foto = ?",
+            (row["caminho_foto"],),
+        )
+        _remover_midias_orfas(conn, [row["caminho_foto"]])
+        return True
 
 
 # --------------------------------------------------------------------------- #

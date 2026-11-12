@@ -31,6 +31,22 @@ CLASSE_STATUS = {"Em Andamento": "andamento", "Pausada": "pausada", "Concluída"
 FORMATO_AUDIO = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg"}
 TODOS_AMBIENTES = "Todos os ambientes"
 CHAVE_OBRA = "obra_selecionada_id"
+MAX_FOTOS_ENVIO = 10  # fotos por envio (registro, tarefa ou galeria)
+TIPOS_FOTO = ["jpg", "jpeg", "png"]
+# Ícone do bloco de ambiente (primeira palavra-chave encontrada, sem acentos).
+ICONES_AMBIENTE = [
+    (("banheiro", "lavabo", "suite", "wc"), "🚿"),
+    (("cozinha",), "🍳"),
+    (("servico", "lavanderia"), "🧺"),
+    (("sala",), "🛋️"),
+    (("quarto", "dormitorio"), "🛏️"),
+    (("varanda", "sacada"), "🌇"),
+    (("garagem",), "🚗"),
+    (("hidraulica",), "🚰"),
+    (("eletrica",), "⚡"),
+    (("externa", "quintal", "jardim", "muro", "calcada", "fachada"), "🌳"),
+    (("cobertura", "telhado", "laje"), "🏠"),
+]
 
 # Limites de tamanho dos campos digitados (também aplicados no servidor via sanitize_text).
 LIM_NOME, LIM_ENDERECO, LIM_ESCOPO = 120, 200, 2_000
@@ -64,8 +80,31 @@ footer {visibility: hidden;}
 .ot-muted {opacity: .72; font-size: .85rem;}
 
 /* ---------- KPIs ---------- */
-[data-testid="stMetric"] {background: rgba(148, 163, 184, .08); border-radius: 14px; padding: .75rem 1rem;}
+[data-testid="stMetric"] {background: rgba(148, 163, 184, .08); border-radius: 14px; padding: .75rem .8rem;}
 [data-testid="stMetricValue"] {font-weight: 700;}
+/* Títulos dos KPIs quebram linha em vez de virar "Total de Tar..." */
+[data-testid="stMetricLabel"], [data-testid="stMetricLabel"] * {
+  white-space: normal !important; overflow: visible !important; text-overflow: clip !important;
+  overflow-wrap: anywhere; line-height: 1.25;
+}
+[data-testid="stMetricLabel"] {height: auto !important; min-height: 2.5em; align-items: flex-start;}
+[data-testid="stMetricLabel"] p {font-size: .85rem;}
+
+/* ---------- Abas: quebram linha (nada cortado no celular) e Galeria em destaque ---------- */
+.stTabs [data-baseweb="tab-list"] {flex-wrap: wrap; gap: .3rem; overflow: visible;}
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] {display: none;}
+.stTabs [data-baseweb="tab"] {border-radius: 10px 10px 0 0; border-bottom: 3px solid transparent;}
+.stTabs [data-baseweb="tab"][aria-selected="true"] {border-bottom-color: #3b82f6; background: rgba(59, 130, 246, .12);}
+.stTabs [data-baseweb="tab"]:nth-of-type(4) {background: rgba(34, 197, 94, .14); font-weight: 700;}
+.stTabs [data-baseweb="tab"]:nth-of-type(4)[aria-selected="true"] {border-bottom-color: #22c55e;}
+
+/* ---------- Checklist: título do ambiente e seções Pendente / Feito ---------- */
+.ot-amb-titulo {font-size: 1.15rem; font-weight: 700; margin: .1rem 0 .3rem;}
+.ot-sec {font-weight: 700; font-size: .9rem; padding: .3rem .7rem; border-radius: 8px; margin: .5rem 0 .2rem;}
+.ot-sec-pend {background: rgba(245, 158, 11, .16); border-left: 4px solid #f59e0b;}
+.ot-sec-ok {background: rgba(34, 197, 94, .14); border-left: 4px solid #22c55e;}
+[class*="st-key-trow_ok_"] [data-testid="stCheckbox"] p {text-decoration: line-through; opacity: .7;}
+.ot-servico {font-style: italic; opacity: .9; margin: .4rem 0 .2rem;}
 
 /* ---------- Badges (texto herda a cor do tema; o fundo dá o significado) ---------- */
 .ot-badge {
@@ -161,12 +200,17 @@ def formatar_bytes(n: int | None) -> str:
     return f"{n / (1024 * 1024):.1f} MB".replace(".", ",")
 
 
-def slug(texto: str) -> str:
-    """'Banheiro Social' -> 'Banheiro-Social' (seguro para nome de arquivo)."""
+def slug(texto: str, sep: str = "-", padrao: str = "Geral") -> str:
+    """'Banheiro Social' -> 'Banheiro-Social' (seguro para nome de arquivo/pasta)."""
     sem_acento = "".join(
         c for c in unicodedata.normalize("NFKD", texto or "") if not unicodedata.combining(c)
     )
-    return re.sub(r"[^A-Za-z0-9]+", "-", sem_acento).strip("-")[:40] or "Geral"
+    return re.sub(r"[^A-Za-z0-9]+", sep, sem_acento).strip(sep)[:40].strip(sep) or padrao
+
+
+def icone_ambiente(ambiente: str) -> str:
+    alvo = db.normalizar_busca(ambiente)
+    return next((ic for chaves, ic in ICONES_AMBIENTE if any(c in alvo for c in chaves)), "📁")
 
 
 def contexto_da_obra(obra: dict) -> str:
@@ -208,18 +252,119 @@ def tarefas_por_registro(tarefas: list[dict]) -> dict[int, list[dict]]:
     return mapa
 
 
-def ambientes_do_registro(r: dict, mapa_tarefas: dict[int, list[dict]], conhecidos: list[str]) -> list[str]:
-    """Ambientes de um registro: os das tarefas extraídas dele ou, sem tarefas, os citados no texto."""
-    das_tarefas = list(dict.fromkeys(t["ambiente"] for t in mapa_tarefas.get(r["id"], [])))
-    if das_tarefas:
-        return das_tarefas
-    texto = db.normalizar_busca(f"{r.get('mapeamento_asbuilt') or ''} {r.get('resumo_executivo') or ''}")
-    citados = [a for a in conhecidos if db.normalizar_busca(a) in texto]
-    return citados or ["Geral"]
+def midias_com_arquivo(midias: list[dict]) -> list[tuple[dict, Path]]:
+    """Fotos cujo arquivo existe em uploads\\ (ignora entradas com arquivo ausente)."""
+    return [(m, p) for m in midias if (p := resolver_caminho(m.get("caminho_foto")))]
 
 
-def registros_com_foto(registros: list[dict]) -> list[tuple[dict, Path]]:
-    return [(r, p) for r in registros if (p := resolver_caminho(r.get("caminho_foto")))]
+def agrupar_midias(midias: list[tuple[dict, Path]]) -> dict[str, dict[tuple[str, str], list[tuple[dict, Path]]]]:
+    """{ambiente: {(titulo_servico, data): [(midia, arquivo), ...]}} — mais recentes primeiro."""
+    grupos: dict[str, dict[tuple[str, str], list]] = {}
+    ordenadas = sorted(midias, key=lambda x: (x[0]["data_midia"], x[0]["id"]), reverse=True)
+    for m, p in ordenadas:
+        servico = (m.get("titulo_servico") or "Registro fotográfico").strip()
+        grupos.setdefault(m["ambiente"] or "Geral", {}).setdefault((servico, m["data_midia"]), []).append((m, p))
+    return dict(sorted(grupos.items(), key=lambda kv: db.normalizar_busca(kv[0])))
+
+
+def midia_corresponde(m: dict, busca: str) -> bool:
+    """Busca normalizada (sem acentos/maiúsculas) em todos os textos ligados à foto."""
+    return db.corresponde_busca(
+        busca, m.get("ambiente"), m.get("titulo_servico"), m.get("descricao_tecnica"),
+        m.get("tarefa_descricao"), m.get("transcricao_audio"), m.get("resumo_executivo"),
+    )
+
+
+def salvar_fotos(
+    arquivos: list,
+    obra_id: int,
+    ambiente: str,
+    titulo_servico: str = "",
+    descricao_tecnica: str = "",
+    tarefa_id: int | None = None,
+    registro_id: int | None = None,
+    data_midia: str | None = None,
+) -> tuple[int, list[str]]:
+    """Valida, comprime e vincula as fotos enviadas a um ambiente/serviço (e tarefa/registro).
+
+    Retorna (quantidade salva, mensagens de erro seguras para o usuário).
+    """
+    salvas, erros = 0, []
+    for i, arq in enumerate(arquivos[:MAX_FOTOS_ENVIO], start=1):
+        dados = arq.getvalue()
+        try:
+            caminho = security.validate_and_save_media(dados, "image")
+        except MidiaInvalidaError as exc:
+            erros.append(f"Foto {i} recusada: {exc}")
+            continue
+        db.inserir_midia_obra(
+            obra_id, caminho, sanitize_text(ambiente, LIM_AMBIENTE) or "Geral",
+            sanitize_text(titulo_servico, LIM_TAREFA), sanitize_text(descricao_tecnica, LIMITE_TEXTO_LONGO),
+            registro_id=registro_id, tarefa_id=tarefa_id, data_midia=data_midia, foto_bytes_original=len(dados),
+        )
+        salvas += 1
+    if len(arquivos) > MAX_FOTOS_ENVIO:
+        erros.append(f"Só as {MAX_FOTOS_ENVIO} primeiras fotos foram enviadas. Envie as demais em outro lote.")
+    return salvas, erros
+
+
+def vincular_fotos_do_registro(
+    obra: dict,
+    registro_id: int,
+    data_iso: str,
+    analise,
+    dados: dict,
+    obs: str,
+    fotos_salvas: list[tuple[str, int]],
+    tarefas_novas: list[dict],
+) -> list[int]:
+    """Grava em midias_obra as fotos de um registro, cada uma no seu ambiente e serviço.
+
+    Usa a classificação da IA por foto; sem ela, a tarefa principal do relato (ex.: "foi
+    retirado a cerâmica do banheiro" → ambiente Banheiro, serviço "Retirada da cerâmica...");
+    sem tarefas, o cômodo citado no relato ou no escopo da obra.
+    """
+    classificadas = {f.indice_foto: f for f in analise.fotos_classificadas}
+    principal = next((t for t in tarefas_novas if t["concluida"]), tarefas_novas[0] if tarefas_novas else None)
+    relato = f"{analise.transcricao_audio} {obs}"
+    ids = []
+    for i, (caminho, tamanho) in enumerate(fotos_salvas, start=1):
+        cls, tarefa = classificadas.get(i), principal
+        if cls:
+            amb = sanitize_text(cls.ambiente, LIM_AMBIENTE) or "Geral"
+            mesmo_amb = [t for t in tarefas_novas if db.normalizar_busca(t["ambiente"]) == db.normalizar_busca(amb)]
+            tarefa = next((t for t in mesmo_amb if t["concluida"]), mesmo_amb[0] if mesmo_amb else None)
+            titulo, descricao = cls.titulo_servico, cls.descricao_tecnica or dados["mapeamento_asbuilt"]
+        elif tarefa:
+            amb, titulo, descricao = tarefa["ambiente"], tarefa["descricao"], dados["mapeamento_asbuilt"]
+        else:
+            escopo = obra.get("escopo_resumo") or ""
+            internos = [a for a in db.ambientes_citados(escopo) if a not in db.AMBIENTES_EXTERNOS]
+            amb = db.detectar_ambiente(relato, escopo, padrao=internos[0] if len(internos) == 1 else "Geral")
+            titulo, descricao = "Registro fotográfico do dia", dados["mapeamento_asbuilt"]
+        ids.append(db.inserir_midia_obra(
+            obra["id"], caminho, amb, sanitize_text(titulo, LIM_TAREFA) or "Registro fotográfico do dia",
+            sanitize_text(descricao, LIMITE_TEXTO_LONGO), registro_id=registro_id,
+            tarefa_id=tarefa["id"] if tarefa else None, data_midia=data_iso, foto_bytes_original=tamanho,
+        ))
+    return ids
+
+
+def grade_fotos(fotos: list[tuple[dict, Path]], prefixo: str, colunas: int = 3, acoes: bool = True) -> None:
+    """Grade de miniaturas com ampliar / editar / excluir."""
+    grade = st.columns(colunas)
+    for i, (m, foto) in enumerate(fotos):
+        with grade[i % colunas].container(border=True):
+            st.image(str(foto), width="stretch")
+            st.caption(info_tamanho(m, foto))
+            if acoes:
+                with st.container(horizontal=True, gap="small"):
+                    if st.button("🔍", key=f"{prefixo}_amp_{m['id']}", help="Ampliar a foto com a descrição técnica"):
+                        dialog_foto(m, foto)
+                    if st.button("✏️", key=f"{prefixo}_edit_{m['id']}", help="Editar ambiente, serviço e descrição da foto"):
+                        dialog_editar_midia(m)
+                    if st.button("🗑️", key=f"{prefixo}_del_{m['id']}", help="Excluir esta foto"):
+                        dialog_excluir_midia(m)
 
 
 def flash(mensagem: str) -> None:
@@ -318,7 +463,7 @@ def imagem_base64(caminho: Path, lado_max: int = 900) -> str | None:
         return None
 
 
-def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict]) -> str:
+def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict], midias: list[dict]) -> str:
     """Relatório autocontido (fotos embutidas, sem metadados) para enviar ou imprimir em PDF."""
     k = indicadores(registros, tarefas)
     cronologicos = sorted(registros, key=lambda r: (r["data_registro"], r["id"]))
@@ -341,15 +486,21 @@ def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict])
     ) or "<p>Nenhuma tarefa registrada.</p>"
 
     galeria = []
-    for r, foto in sorted(registros_com_foto(registros), key=lambda x: (x[0]["data_registro"], x[0]["id"])):
-        b64 = imagem_base64(foto)
-        if not b64:
-            continue
-        galeria.append(
-            f"<figure><img src='data:image/jpeg;base64,{b64}' alt='Foto técnica'>"
-            f"<figcaption><strong>{esc(formatar_data(r['data_registro']))}</strong> — "
-            f"{esc(r['mapeamento_asbuilt'] or '-')}</figcaption></figure>"
-        )
+    for ambiente, servicos in agrupar_midias(midias_com_arquivo(midias)).items():
+        figuras = []
+        for (servico, data_m), itens in servicos.items():
+            for m, foto in itens:
+                if not (b64 := imagem_base64(foto)):
+                    continue
+                detalhe = f"<br>{esc(m['descricao_tecnica'])}" if m.get("descricao_tecnica") else ""
+                figuras.append(
+                    f"<figure><img src='data:image/jpeg;base64,{b64}' alt='Foto técnica'>"
+                    f"<figcaption><strong>{esc(servico, LIM_TAREFA)}</strong> — {esc(formatar_data(data_m))}"
+                    f"{detalhe}</figcaption></figure>"
+                )
+        if figuras:
+            galeria.append(f"<h3>{icone_ambiente(ambiente)} {esc(ambiente, LIM_AMBIENTE)}</h3>"
+                           f"<div class='galeria'>{''.join(figuras)}</div>")
 
     diario = "".join(
         f"""<section class="dia">
@@ -381,7 +532,7 @@ def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict])
  ul{{list-style:none;padding-left:2px;margin:0}} li{{margin:3px 0}} li.pend{{color:#64748b}}
  table{{width:100%;border-collapse:collapse}} td,th{{border:1px solid #e2e8f0;padding:7px 9px;vertical-align:top;text-align:left}}
  th{{background:#f1f5f9}} .nowrap{{white-space:nowrap}}
- .galeria{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}}
+ .galeria{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:16px}}
  figure{{margin:0;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;page-break-inside:avoid}}
  figure img{{width:100%;display:block}} figcaption{{padding:8px 10px;font-size:.88rem}}
  .dia{{border-top:1px solid #e2e8f0;padding-top:10px;margin-top:12px;page-break-inside:avoid}}
@@ -407,8 +558,8 @@ def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict])
 {checklist}
 <h2>Justificativas de prazo</h2>
 <table><tr><th>Data</th><th>Motivo</th></tr>{linhas_atraso}</table>
-<h2>Galeria As-Built (mapa de tubulações e instalações)</h2>
-{f'<div class="galeria">{"".join(galeria)}</div>' if galeria else '<p>Nenhuma foto técnica registrada.</p>'}
+<h2>Galeria da obra por ambiente (As-Built)</h2>
+{"".join(galeria) if galeria else '<p>Nenhuma foto técnica registrada.</p>'}
 <h2>Diário de obra</h2>
 {diario}
 <footer>Relatório gerado pelo ObraTrack AI em {date.today():%d/%m/%Y}.</footer>
@@ -426,15 +577,19 @@ def _bytes_foto_para_zip(foto: Path) -> bytes:
     return security.strip_image_exif(dados) if tem_metadados else dados
 
 
-def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict]) -> bytes:
-    """ZIP em memória com as fotos renomeadas (01_2026-11-12_Banheiro-Social.jpg) e o memorial.
+def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], midias: list[dict]) -> bytes:
+    """ZIP em memória com as fotos em subpastas por ambiente e o memorial descritivo.
 
+    Ex.: Banheiro_Social/01_2026-11-11_retirada_da_ceramica.jpg, Cozinha/01_...jpg.
     Os nomes organizados existem só dentro do ZIP; no servidor as fotos seguem com nome UUID.
     """
     s = sanitize_text
-    mapa = tarefas_por_registro(tarefas)
-    conhecidos = db.listar_ambientes_recomendados(obra["id"])
-    fotos = sorted(registros_com_foto(registros), key=lambda x: (x[0]["data_registro"], x[0]["id"]))
+    # Pastas por ambiente (ambientes que só diferem em acento/maiúscula caem na mesma pasta).
+    pastas: dict[str, list[tuple[dict, Path]]] = {}
+    for m, foto in sorted(midias_com_arquivo(midias), key=lambda x: (x[0]["data_midia"], x[0]["id"])):
+        pastas.setdefault(slug(m["ambiente"], "_"), []).append((m, foto))
+    pastas = dict(sorted(pastas.items(), key=lambda kv: kv[0].casefold()))
+    total_fotos = sum(len(v) for v in pastas.values())
 
     sep = "=" * 72
     memorial = [
@@ -445,31 +600,35 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict]) ->
         f"Escopo       : {s(obra.get('escopo_resumo') or 'não informado', LIM_ESCOPO)}",
         f"Status       : {obra['status']} · Início em {formatar_data(obra['data_inicio'])}",
         f"Emitido em   : {datetime.now():%d/%m/%Y %H:%M}",
-        f"Fotos        : {len(fotos)}",
+        f"Fotos        : {total_fotos} em {len(pastas)} pasta(s) de ambiente",
         "",
         "Cada foto registra a posição real de tubulações, conduítes e fiação antes do",
         "fechamento (reboco/revestimento). Consulte antes de furar paredes ou pisos.",
         "",
-        "1. FOTOS E DESCRIÇÃO TÉCNICA",
+        "1. FOTOS POR AMBIENTE E SERVIÇO",
         sep,
     ]
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        for i, (r, foto) in enumerate(fotos, start=1):
-            ambientes = ambientes_do_registro(r, mapa, conhecidos)
-            nome = f"{i:02d}_{r['data_registro']}_{slug(ambientes[0])}{foto.suffix.lower()}"
-            zf.writestr(nome, _bytes_foto_para_zip(foto), compress_type=zipfile.ZIP_STORED)
-            memorial += [
-                f"[{i:02d}] {nome}",
-                f"     Data       : {formatar_data(r['data_registro'])}",
-                f"     Ambiente(s): {', '.join(s(a, LIM_AMBIENTE) for a in ambientes)}",
-                f"     As-Built   : {s(r.get('mapeamento_asbuilt') or '-')}",
-                f"     Serviços   : {s(r.get('resumo_executivo') or '-')}",
-            ]
-            if tem_atraso(r.get("motivo_atraso")):
-                memorial.append(f"     Atraso     : {s(r['motivo_atraso'])}")
-            memorial.append("")
-        if not fotos:
+        for pasta, itens in pastas.items():
+            memorial += [f"AMBIENTE: {s(itens[0][0]['ambiente'], LIM_AMBIENTE).upper()}  (pasta {pasta}/)", "-" * 72]
+            for i, (m, foto) in enumerate(itens, start=1):
+                servico = m.get("titulo_servico") or "Registro fotográfico"
+                nome = f"{pasta}/{i:02d}_{m['data_midia']}_{slug(servico, '_', 'foto').lower()}{foto.suffix.lower()}"
+                zf.writestr(nome, _bytes_foto_para_zip(foto), compress_type=zipfile.ZIP_STORED)
+                memorial += [
+                    f"[{i:02d}] {nome}",
+                    f"     Data       : {formatar_data(m['data_midia'])}",
+                    f"     Serviço    : {s(servico, LIM_TAREFA)}",
+                    f"     As-Built   : {s(m.get('descricao_tecnica') or '-')}",
+                ]
+                if m.get("tarefa_descricao"):
+                    status = "concluída" if m.get("tarefa_concluida") else "pendente"
+                    memorial.append(f"     Tarefa     : {s(m['tarefa_descricao'], LIM_TAREFA)} ({status})")
+                if tem_atraso(m.get("motivo_atraso")):
+                    memorial.append(f"     Atraso     : {s(m['motivo_atraso'])}")
+                memorial.append("")
+        if not pastas:
             memorial += ["Nenhuma foto técnica registrada.", ""]
 
         memorial += ["2. HISTÓRICO DA OBRA", sep]
@@ -518,8 +677,9 @@ def tocar_audio(caminho: Path) -> None:
     st.audio(str(caminho), format=FORMATO_AUDIO.get(caminho.suffix.lower(), "audio/wav"))
 
 
-def card_registro(r: dict, tarefas: list[dict] | None = None, com_acoes: bool = False) -> None:
-    """Card de um registro: data, badge, áudio, atraso, resumo, tarefas, foto + As-Built, transcrição."""
+def card_registro(r: dict, tarefas: list[dict] | None = None, com_acoes: bool = False,
+                  midias: list[dict] | None = None) -> None:
+    """Card de um registro: data, badge, áudio, atraso, resumo, tarefas, fotos + As-Built, transcrição."""
     with st.container(border=True):
         st.markdown(
             f"<span class='ot-data'>📅 {esc(formatar_data(r['data_registro']))}</span> &nbsp; "
@@ -544,13 +704,17 @@ def card_registro(r: dict, tarefas: list[dict] | None = None, com_acoes: bool = 
             st.markdown("**🧱 Tarefas identificadas:**")
             lista_tarefas_simples(tarefas)
 
-        foto = resolver_caminho(r.get("caminho_foto"))
-        if foto:
-            c_foto, c_txt = st.columns([1, 1])
-            c_foto.image(str(foto), width="stretch")
-            c_txt.markdown(f"**📐 Mapeamento As-Built:**\n\n{r.get('mapeamento_asbuilt') or '-'}")
-        elif r.get("mapeamento_asbuilt"):
+        if r.get("mapeamento_asbuilt"):
             st.markdown(f"**📐 Mapeamento As-Built:** {r['mapeamento_asbuilt']}")
+        fotos = midias_com_arquivo(midias or [])
+        if fotos:
+            st.markdown(f"**📷 {len(fotos)} foto(s) do dia:** "
+                        + "".join(badge_ambiente(a) for a in dict.fromkeys(m["ambiente"] for m, _ in fotos)),
+                        unsafe_allow_html=True)
+            colunas = st.columns(min(len(fotos), 3))
+            for i, (m, foto) in enumerate(fotos):
+                colunas[i % len(colunas)].image(str(foto), width="stretch",
+                                                caption=sanitize_text(m.get("titulo_servico"), LIM_TAREFA) or None)
 
         if r.get("transcricao_audio"):
             with st.expander("📝 Transcrição do áudio"):
@@ -560,8 +724,8 @@ def card_registro(r: dict, tarefas: list[dict] | None = None, com_acoes: bool = 
             with st.container(horizontal=True):
                 if st.button("✏️ Editar Registro", key=f"edit_reg_{r['id']}", help="Corrigir transcrição, resumo, produtividade, atrasos ou As-Built."):
                     dialog_editar_registro(r)
-                if st.button("🗑️ Excluir Registro", key=f"del_reg_{r['id']}", help="Remove o registro, o áudio e a foto (pede confirmação)."):
-                    dialog_excluir_registro(r, len(tarefas or []))
+                if st.button("🗑️ Excluir Registro", key=f"del_reg_{r['id']}", help="Remove o registro e o áudio (pede confirmação)."):
+                    dialog_excluir_registro(r, len(tarefas or []), len(fotos))
 
 
 def card_obra(o: dict, resumo: dict, selecionada: bool, chave: str) -> None:
@@ -633,24 +797,29 @@ def dialog_editar_registro(r: dict) -> None:
 
 
 @st.dialog("🗑️ Excluir Registro")
-def dialog_excluir_registro(r: dict, qtd_tarefas: int) -> None:
+def dialog_excluir_registro(r: dict, qtd_tarefas: int, qtd_fotos: int = 0) -> None:
     st.warning(
         f"Excluir o registro de **{formatar_data(r['data_registro'])}**? "
-        "O áudio e a foto deste registro também serão apagados. Esta ação não pode ser desfeita.",
+        "O áudio deste registro também será apagado. Esta ação não pode ser desfeita.",
         icon="⚠️",
     )
-    apagar_tarefas = False
+    apagar_tarefas = apagar_fotos = False
     if qtd_tarefas:
         apagar_tarefas = st.checkbox(
             f"Excluir também as {qtd_tarefas} tarefa(s) do checklist extraídas deste registro",
             help="Desmarcado: as tarefas continuam no checklist da obra.",
         )
+    if qtd_fotos:
+        apagar_fotos = st.checkbox(
+            f"Excluir também as {qtd_fotos} foto(s) deste registro",
+            help="Desmarcado: as fotos continuam na Galeria da Obra, no ambiente delas.",
+        )
     c1, c2 = st.columns(2)
     if c1.button("Cancelar", width="stretch"):
         st.rerun()
-    if c2.button("Excluir definitivamente", type="primary", width="stretch"):
-        db.excluir_registro_diario(r["id"], excluir_tarefas=apagar_tarefas)
-        flash("Registro excluído.")
+    # A exclusão roda no on_click (antes de qualquer rerun, do dialog ou da página inteira).
+    if c2.button("Excluir definitivamente", type="primary", width="stretch", key=f"ok_del_reg_{r['id']}",
+                 on_click=_excluir_registro_cb, args=(r["id"], apagar_tarefas, apagar_fotos)):
         st.rerun()
 
 
@@ -665,33 +834,81 @@ def dialog_excluir_obra(obra: dict, qtd_registros: int, qtd_tarefas: int) -> Non
     c1, c2 = st.columns(2)
     if c1.button("Cancelar", width="stretch"):
         st.rerun()
-    if c2.button("Excluir bloco", type="primary", width="stretch", disabled=not confirmado):
-        db.excluir_obra(obra["id"])
-        selecionar_obra(None)
-        flash(f"Bloco “{obra['nome_cliente']}” excluído.")
+    if c2.button("Excluir bloco", type="primary", width="stretch", disabled=not confirmado,
+                 key=f"ok_del_obra_{obra['id']}", on_click=_excluir_obra_cb, args=(obra["id"], obra["nome_cliente"])):
         st.rerun()
 
 
 @st.dialog("📐 Foto As-Built", width="large")
-def dialog_foto(r: dict, foto: Path, ambientes: list[str]) -> None:
+def dialog_foto(m: dict, foto: Path) -> None:
     st.image(str(foto), width="stretch")
     st.markdown(
-        f"<span class='ot-data'>📅 {esc(formatar_data(r['data_registro']))}</span> &nbsp; "
-        + "".join(badge_ambiente(a) for a in ambientes),
+        f"<span class='ot-data'>📅 {esc(formatar_data(m['data_midia']))}</span> &nbsp; {badge_ambiente(m['ambiente'])}",
         unsafe_allow_html=True,
     )
-    st.caption(info_tamanho(r, foto))
-    st.markdown(f"**📐 Descrição técnica (canos, conduítes e fiação):**\n\n{r.get('mapeamento_asbuilt') or '-'}")
-    st.markdown(f"**Serviços do dia:** {r.get('resumo_executivo') or '-'}")
-    if tem_atraso(r.get("motivo_atraso")):
-        st.warning(f"**Justificativa de atraso:** {r['motivo_atraso']}", icon="⚠️")
+    st.markdown(f"**Serviço:** {m.get('titulo_servico') or '-'}")
+    st.caption(info_tamanho(m, foto))
+    st.markdown(f"**📐 Descrição técnica (canos, conduítes e fiação):**\n\n{m.get('descricao_tecnica') or '-'}")
+    if m.get("tarefa_descricao"):
+        st.markdown(f"**Tarefa vinculada:** {'✅' if m.get('tarefa_concluida') else '⏳'} {m['tarefa_descricao']}")
+    if m.get("resumo_executivo"):
+        st.markdown(f"**Serviços do dia:** {m['resumo_executivo']}")
+    if tem_atraso(m.get("motivo_atraso")):
+        st.warning(f"**Justificativa de atraso:** {m['motivo_atraso']}", icon="⚠️")
+
+
+@st.dialog("✏️ Editar Foto")
+def dialog_editar_midia(m: dict) -> None:
+    with st.form(f"form_edit_midia_{m['id']}", enter_to_submit=False, border=False):
+        amb = seletor_ambiente("Ambiente", db.listar_ambientes_recomendados(m["obra_id"]), atual=m["ambiente"])
+        titulo = st.text_input("Serviço realizado", value=m.get("titulo_servico") or "", max_chars=LIM_TAREFA,
+                               help="Ex.: Retirada da cerâmica do banheiro.")
+        descricao = st.text_area("Descrição técnica", value=m.get("descricao_tecnica") or "",
+                                 max_chars=LIMITE_TEXTO_LONGO,
+                                 help="Posição de canos, conduítes e fiação, medidas de referência.")
+        if st.form_submit_button("💾 Salvar foto", type="primary", width="stretch"):
+            db.editar_midia_obra(m["id"], sanitize_text(amb, LIM_AMBIENTE) or "Geral",
+                                 sanitize_text(titulo, LIM_TAREFA), sanitize_text(descricao, LIMITE_TEXTO_LONGO))
+            flash("Foto atualizada.")
+            st.rerun()
+
+
+@st.dialog("🗑️ Excluir Foto")
+def dialog_excluir_midia(m: dict) -> None:
+    if foto := resolver_caminho(m.get("caminho_foto")):
+        st.image(str(foto), width=240)
+    st.warning(f"Excluir esta foto de **{m['ambiente']}**? Esta ação não pode ser desfeita.", icon="⚠️")
+    c1, c2 = st.columns(2)
+    if c1.button("Cancelar", width="stretch", key=f"cancel_del_midia_{m['id']}"):
+        st.rerun()
+    if c2.button("Excluir foto", type="primary", width="stretch", key=f"ok_del_midia_{m['id']}",
+                 on_click=_excluir_midia_cb, args=(m["id"],)):
+        st.rerun()
+
+
+def _excluir_registro_cb(registro_id: int, excluir_tarefas: bool, excluir_fotos: bool) -> None:
+    db.excluir_registro_diario(registro_id, excluir_tarefas=excluir_tarefas, excluir_fotos=excluir_fotos)
+    flash("Registro excluído.")
+
+
+def _excluir_obra_cb(obra_id: int, nome: str) -> None:
+    db.excluir_obra(obra_id)
+    selecionar_obra(None)
+    flash(f"Bloco “{nome}” excluído.")
+
+
+def _excluir_midia_cb(midia_id: int) -> None:
+    db.excluir_midia_obra(midia_id)
+    flash("Foto excluída.")
 
 
 # --------------------------------------------------------------------------- #
 # Callbacks (rodam antes do script, atualizando o banco/estado na hora)
 # --------------------------------------------------------------------------- #
-def _ao_marcar_tarefa(tarefa_id: int) -> None:
-    db.alternar_status_tarefa(tarefa_id, st.session_state[f"tarefa_{tarefa_id}"])
+def _ao_marcar_tarefa(tarefa_id: int, descricao: str) -> None:
+    feita = bool(st.session_state[f"tarefa_{tarefa_id}"])
+    db.alternar_status_tarefa(tarefa_id, feita)
+    flash(f"“{descricao}” {'marcada como ✅ feita' if feita else 'voltou para ⏳ pendente'}.")
 
 
 def _ao_excluir_tarefa(tarefa_id: int, descricao: str) -> None:
@@ -705,7 +922,8 @@ def _chaves_filtro(obra_id: int) -> dict[str, str]:
 
 
 def _limpar_filtros(obra_id: int) -> None:
-    for chave in _chaves_filtro(obra_id).values():
+    """Reseta a busca global, os Filtros avançados e os filtros da galeria."""
+    for chave in [*_chaves_filtro(obra_id).values(), f"galeria_amb_{obra_id}", f"galeria_txt_{obra_id}"]:
         st.session_state.pop(chave, None)
 
 
@@ -865,14 +1083,20 @@ area_metricas = st.container()
 # Busca Global e Filtros Avançados (valem para checklist, histórico e galeria)
 # --------------------------------------------------------------------------- #
 chaves = _chaves_filtro(obra_id)
-busca_global = st.text_input(
+c_busca, c_limpar = st.columns([4, 1], vertical_alignment="bottom")
+busca_global = c_busca.text_input(
     "Busca global na obra",
-    placeholder="🔍 Pesquisar em tarefas, transcrições, canos, materiais ou atrasos...",
+    placeholder="🔍 Pesquisar em tarefas, ambientes, transcrições, serviços das fotos...",
     key=chaves["busca"], max_chars=LIM_BUSCA,
-    help="Filtra o checklist, o histórico e a galeria. Várias palavras: todas precisam aparecer. "
-    "Não diferencia maiúsculas nem acentos.",
+    help="Filtra o checklist, o histórico e a galeria. Procura em ambiente, tarefa, transcrição, resumo "
+    "do dia e serviço das fotos. Várias palavras: todas precisam aparecer. Não diferencia maiúsculas nem acentos.",
 )
-ambientes_da_obra = list(dict.fromkeys(t["ambiente"] for t in db.listar_tarefas_obra(obra_id)))
+c_limpar.button("✖️ Limpar Filtros", key=f"btn_limpar_topo_{obra_id}", on_click=_limpar_filtros, args=(obra_id,),
+                width="stretch", help="Apaga a busca e todos os filtros avançados de uma vez.")
+midias_obra = db.listar_midias_obra(obra_id)
+ambientes_da_obra = list(dict.fromkeys(
+    [t["ambiente"] for t in db.listar_tarefas_obra(obra_id)] + [m["ambiente"] for m in midias_obra]
+))
 if chaves["ambientes"] in st.session_state:
     # Remove da seleção ambientes que deixaram de existir (ex.: última tarefa excluída).
     st.session_state[chaves["ambientes"]] = [a for a in st.session_state[chaves["ambientes"]] if a in ambientes_da_obra]
@@ -912,7 +1136,7 @@ aba_registro, aba_checklist, aba_historico, aba_galeria = st.tabs([
     "🎙️ Novo Registro (Áudio/Foto)",
     "✅ Checklist de Tarefas (Por Ambiente)",
     "📋 Histórico e Diários (Editar/Excluir)",
-    "📐 Galeria As-Built & Relatório",
+    "🖼️ Galeria da Obra & Relatórios",
 ])
 
 
@@ -927,12 +1151,14 @@ with aba_registro:
             help="Toque no microfone e conte, cômodo por cômodo, o que foi feito, o que falta, o que "
             "atrasou (chuva, faltas, material) e onde passaram canos/fios.",
         )
-        foto_up = st.file_uploader(
-            "Adicionar foto da reforma / tubulação",
-            type=["jpg", "jpeg", "png"],
-            help="Fotografe a parede/piso ANTES do reboco ou revestimento, com uma referência de medida, "
-            "para documentar a posição das tubulações. A foto é compactada e a localização e os dados "
-            "do celular são removidos.",
+        fotos_up = st.file_uploader(
+            "Adicionar fotos da reforma / tubulação (pode enviar várias)",
+            type=TIPOS_FOTO,
+            accept_multiple_files=True,
+            help="Fotografe a parede/piso ANTES do reboco ou revestimento, com uma referência de medida. "
+            "As fotos vão para a Galeria no ambiente e serviço do relato (ex.: 'retirei a cerâmica do "
+            f"banheiro' → Banheiro). Até {MAX_FOTOS_ENVIO} por registro; são compactadas e a localização "
+            "e os dados do celular são removidos.",
         )
         c_obs, c_data = st.columns([2, 1])
         obs = c_obs.text_input(
@@ -951,8 +1177,8 @@ with aba_registro:
 
     if enviar:
         obs = sanitize_text(obs, LIM_OBS)
-        caminho_audio = caminho_foto = None
-        bytes_foto_original = None
+        caminho_audio = None
+        fotos_salvas: list[tuple[str, int]] = []  # (caminho relativo, tamanho original)
         erros_midia: list[str] = []
         # Cada mídia é validada pelo conteúdo real e salva com nome aleatório (UUID).
         if audio:
@@ -960,46 +1186,45 @@ with aba_registro:
                 caminho_audio = security.validate_and_save_media(audio.getvalue(), "audio")
             except MidiaInvalidaError as exc:
                 erros_midia.append(f"Áudio recusado: {exc}")
-        if foto_up:
+        for i, arq in enumerate((fotos_up or [])[:MAX_FOTOS_ENVIO], start=1):
             try:
-                dados_foto = foto_up.getvalue()
-                caminho_foto = security.validate_and_save_media(dados_foto, "image")
-                bytes_foto_original = len(dados_foto)
+                dados_foto = arq.getvalue()
+                fotos_salvas.append((security.validate_and_save_media(dados_foto, "image"), len(dados_foto)))
             except MidiaInvalidaError as exc:
-                erros_midia.append(f"Foto recusada: {exc}")
+                erros_midia.append(f"Foto {i} recusada: {exc}")
+        if len(fotos_up or []) > MAX_FOTOS_ENVIO:
+            erros_midia.append(f"Só as {MAX_FOTOS_ENVIO} primeiras fotos foram usadas neste registro.")
 
         for erro in erros_midia:
             st.warning(erro, icon="⚠️")
 
-        if not (caminho_audio or caminho_foto or obs):
+        if not (caminho_audio or fotos_salvas or obs):
             st.error("Grave um áudio, envie uma foto ou escreva uma observação.")
         else:
             audio_abs = BASE_DIR / caminho_audio if caminho_audio else None
-            foto_abs = BASE_DIR / caminho_foto if caminho_foto else None
+            fotos_abs = [BASE_DIR / c for c, _ in fotos_salvas]
 
-            with st.spinner("Transcrevendo o áudio e identificando as tarefas por ambiente..."):
+            with st.spinner("Transcrevendo o áudio e identificando as tarefas e fotos por ambiente..."):
                 try:
                     analise = processar_registro_obra(
                         caminho_audio=audio_abs,
-                        caminho_foto=foto_abs,
+                        caminho_foto=fotos_abs,
                         observacoes_texto=obs,
                         contexto_obra=contexto_da_obra(obra),
                     )
                 except Exception:  # salvaguarda final: o registro nunca deixa de ser salvo
                     logging.getLogger("obratrack.app").exception("Erro inesperado na análise")
-                    analise = gerar_analise_offline(obs, contexto_da_obra(obra), audio_abs is not None, foto_abs)
+                    analise = gerar_analise_offline(obs, contexto_da_obra(obra), audio_abs is not None, fotos_abs)
 
             dados = {
                 campo: (valor if campo == "nivel_produtividade" else sanitize_text(valor, LIMITE_TEXTO_LONGO))
-                for campo, valor in analise.model_dump(exclude={"tarefas_extraidas"}).items()
+                for campo, valor in analise.model_dump(exclude={"tarefas_extraidas", "fotos_classificadas"}).items()
             }
             novo_id = db.inserir_registro(
                 obra_id=obra_id,
                 data_registro=data_reg.isoformat(),
-                caminho_foto=caminho_foto,
                 caminho_audio=caminho_audio,
-                foto_bytes_original=bytes_foto_original,
-                **dados,
+                **dados,  # as fotos vão para midias_obra (galeria por ambiente), abaixo
             )
             tarefas_novas = []
             for t in analise.tarefas_extraidas:
@@ -1009,21 +1234,21 @@ with aba_registro:
                     tid = db.inserir_tarefa(obra_id, novo_id, amb, desc, int(t.concluida))
                     tarefas_novas.append({"id": tid, "ambiente": amb, "descricao": desc, "concluida": int(t.concluida)})
 
+            vincular_fotos_do_registro(obra, novo_id, data_reg.isoformat(), analise, dados, obs,
+                                       fotos_salvas, tarefas_novas)
+
             st.success("Registro salvo com sucesso no bloco da cliente!")
             if analise.modo_offline:
                 st.info(analise.aviso, icon="ℹ️")
             if tarefas_novas:
                 st.caption(f"🧱 {len(tarefas_novas)} tarefa(s) adicionada(s) ao checklist da obra.")
+            if fotos_salvas:
+                st.caption(f"🖼️ {len(fotos_salvas)} foto(s) vinculada(s) na Galeria da Obra.")
             card_registro(
-                {
-                    "id": novo_id,
-                    "data_registro": data_reg.isoformat(),
-                    "caminho_foto": str(caminho_foto) if caminho_foto else None,
-                    "caminho_audio": str(caminho_audio) if caminho_audio else None,
-                    "foto_bytes_original": bytes_foto_original,
-                    **dados,
-                },
+                {"id": novo_id, "data_registro": data_reg.isoformat(),
+                 "caminho_audio": str(caminho_audio) if caminho_audio else None, **dados},
                 tarefas=tarefas_novas,
+                midias=db.listar_midias_obra(obra_id, registro_id=novo_id),
             )
 
 # Dados completos (KPIs, relatórios, ZIP) e dados filtrados (listas na tela).
@@ -1032,6 +1257,33 @@ tarefas = db.listar_tarefas_obra(obra_id)
 registros_filtrados = db.buscar_registros(obra_id, **filtro) if filtrando else registros
 tarefas_filtradas = db.buscar_tarefas(obra_id, status=f_status, **filtro) if filtrando else tarefas
 mapa_tarefas = tarefas_por_registro(tarefas)
+midias_obra = db.listar_midias_obra(obra_id)  # recarrega: o registro acima pode ter adicionado fotos
+midias_por_registro: dict[int, list[dict]] = {}
+midias_por_tarefa: dict[int, list[dict]] = {}
+for _m in midias_obra:
+    if _m["registro_id"]:
+        midias_por_registro.setdefault(_m["registro_id"], []).append(_m)
+    if _m["tarefa_id"]:
+        midias_por_tarefa.setdefault(_m["tarefa_id"], []).append(_m)
+
+
+def filtrar_midias(midias: list[dict]) -> list[dict]:
+    """Aplica a busca global e os filtros avançados às fotos da galeria."""
+    if not filtrando:
+        return midias
+    ids_registros = None
+    if filtro["niveis"] or filtro["apenas_atraso"]:
+        # Produtividade/atraso pertencem ao registro do dia em que a foto foi enviada.
+        ids_registros = {r["id"] for r in db.buscar_registros(
+            obra_id, niveis=filtro["niveis"], apenas_atraso=filtro["apenas_atraso"], texto_sem_atraso=SEM_ATRASO)}
+    return [
+        m for m in midias
+        if midia_corresponde(m, filtro["busca"])
+        and (not filtro["ambientes"] or m["ambiente"] in filtro["ambientes"])
+        and (not filtro["data_inicio"] or m["data_midia"] >= filtro["data_inicio"])
+        and (not filtro["data_fim"] or m["data_midia"] <= filtro["data_fim"])
+        and (ids_registros is None or m["registro_id"] in ids_registros)
+    ]
 
 if excluir_bloco:
     dialog_excluir_obra(obra, len(registros), len(tarefas))
@@ -1046,6 +1298,53 @@ if filtrando:
 # --------------------------------------------------------------------------- #
 # Aba 2: Checklist de Tarefas por Ambiente
 # --------------------------------------------------------------------------- #
+def linha_tarefa(t: dict) -> None:
+    """Uma tarefa: checkbox (1 clique, on_change), editar, anexar fotos e excluir."""
+    chave = f"tarefa_{t['id']}"
+    # O estado do checkbox segue sempre o banco (sem `value=`), então um clique basta e
+    # a tarefa troca de seção (Pendente ↔ Feito) já na próxima renderização.
+    st.session_state[chave] = bool(t["concluida"])
+    fotos_t = midias_por_tarefa.get(t["id"], [])
+    secao = "ok" if t["concluida"] else "pend"
+    with st.container(horizontal=True, vertical_alignment="center", gap="small", key=f"trow_{secao}_{t['id']}"):
+        st.checkbox(t["descricao"], key=chave, on_change=_ao_marcar_tarefa, args=(t["id"], t["descricao"]),
+                    width="stretch", help="Marque quando o serviço estiver feito; desmarque para voltar a pendente.")
+        if fotos_t:
+            st.caption(f"📷 {len(fotos_t)}", help="Fotos vinculadas a esta tarefa (veja na Galeria da Obra).")
+        with st.popover("✏️", help="Editar texto ou trocar o ambiente (ex.: tarefa que caiu em “Área Externa”)"):
+            with st.form(f"form_edit_tarefa_{t['id']}", enter_to_submit=False, border=False):
+                e_amb = seletor_ambiente("Ambiente", recomendados, atual=t["ambiente"])
+                e_desc = st.text_input("Descrição", value=t["descricao"], max_chars=LIM_TAREFA, help="Texto da tarefa.")
+                st.caption("As fotos desta tarefa acompanham a troca de ambiente.")
+                if st.form_submit_button("💾 Salvar", type="primary", width="stretch"):
+                    if desc_ok := sanitize_text(e_desc, LIM_TAREFA):
+                        db.editar_tarefa(t["id"], sanitize_text(e_amb, LIM_AMBIENTE), desc_ok)
+                        flash("Tarefa atualizada.")
+                        st.rerun()
+                    else:
+                        st.error("A descrição não pode ficar vazia.")
+        with st.popover("📷", help="Anexar fotos a esta tarefa"):
+            with st.form(f"form_fotos_tarefa_{t['id']}", clear_on_submit=True, enter_to_submit=False, border=False):
+                st.markdown(f"**Fotos de:** {t['descricao']}")
+                novas = st.file_uploader("Fotos", type=TIPOS_FOTO, accept_multiple_files=True,
+                                         key=f"up_tarefa_{t['id']}", help=f"Até {MAX_FOTOS_ENVIO} por envio.")
+                desc_foto = st.text_input("Descrição técnica (opcional)", max_chars=LIM_TAREFA,
+                                          placeholder="Ex.: cano de água fria a 30 cm do piso")
+                if st.form_submit_button("📎 Anexar fotos", type="primary", width="stretch"):
+                    if not novas:
+                        st.error("Escolha ao menos uma foto.")
+                    else:
+                        n, erros = salvar_fotos(novas, obra_id, t["ambiente"], t["descricao"], desc_foto,
+                                                tarefa_id=t["id"])
+                        for e in erros:
+                            st.warning(e, icon="⚠️")
+                        if n:
+                            flash(f"{n} foto(s) anexada(s) à tarefa.")
+                            st.rerun()
+        st.button("🗑️", key=f"del_tarefa_{t['id']}", on_click=_ao_excluir_tarefa,
+                  args=(t["id"], t["descricao"]), help="Excluir esta tarefa do checklist (as fotos ficam na galeria)")
+
+
 with aba_checklist:
     grupos = agrupar_por_ambiente(tarefas)
 
@@ -1059,11 +1358,21 @@ with aba_checklist:
                 help="Atividade curta e objetiva.",
             )
             nova_ok = st.checkbox("Já concluída", help="Marque se a tarefa já foi executada.")
+            novas_fotos = st.file_uploader(
+                "Fotos desta tarefa (opcional)", type=TIPOS_FOTO, accept_multiple_files=True,
+                key=f"up_nova_tarefa_{obra_id}",
+                help="As fotos entram na Galeria da Obra já no ambiente e no serviço desta tarefa.",
+            )
             if st.form_submit_button("Adicionar ao checklist", width="stretch"):
                 if desc_ok := sanitize_text(nova_desc, LIM_TAREFA):
-                    db.inserir_tarefa(obra_id, None, sanitize_text(nova_amb, LIM_AMBIENTE) or "Geral", desc_ok, int(nova_ok))
-                    flash("Tarefa adicionada ao checklist.")
-                    st.rerun()
+                    amb_ok = sanitize_text(nova_amb, LIM_AMBIENTE) or db.detectar_ambiente(desc_ok, obra.get("escopo_resumo") or "")
+                    tid = db.inserir_tarefa(obra_id, None, amb_ok, desc_ok, int(nova_ok))
+                    n, erros = salvar_fotos(novas_fotos or [], obra_id, amb_ok, desc_ok, tarefa_id=tid)
+                    for e in erros:
+                        st.warning(e, icon="⚠️")
+                    flash(f"Tarefa adicionada em {amb_ok}" + (f" com {n} foto(s)." if n else "."))
+                    if not erros:
+                        st.rerun()
                 else:
                     st.error("Descreva a tarefa.")
 
@@ -1072,7 +1381,8 @@ with aba_checklist:
     else:
         concluidas = sum(t["concluida"] for t in tarefas)
         pct = concluidas / len(tarefas)
-        st.progress(pct, text=f"**{pct:.0%} concluído** · {concluidas} de {len(tarefas)} tarefas")
+        st.progress(pct, text=f"**{pct:.0%} concluído** · ✅ {concluidas} feita(s) · "
+                              f"⏳ {len(tarefas) - concluidas} pendente(s) · {len(tarefas)} no total")
 
         # Contadores por cômodo (sempre sobre todas as tarefas, independentemente dos filtros).
         st.markdown(
@@ -1080,42 +1390,44 @@ with aba_checklist:
             unsafe_allow_html=True,
         )
 
-        if not tarefas_filtradas:
-            st.info("Nenhuma tarefa com a busca/filtros atuais.")
+        # Nunca deixa o usuário "perdido": se o filtro esconde tarefas, avisa e oferece mostrar tudo.
+        ocultas = len(tarefas) - len(tarefas_filtradas)
+        if filtrando and ocultas:
+            with st.container(border=True):
+                st.warning(
+                    f"🔎 O filtro atual mostra **{len(tarefas_filtradas)} de {len(tarefas)}** tarefa(s); "
+                    f"**{ocultas}** estão ocultas." if tarefas_filtradas else
+                    f"🔎 Nenhuma tarefa corresponde à busca/filtros atuais. As **{len(tarefas)}** tarefa(s) "
+                    "da obra estão ocultas.",
+                    icon="⚠️",
+                )
+                st.button(f"Mostrar todas as {len(tarefas)} tarefas da obra", key=f"mostrar_todas_{obra_id}",
+                          on_click=_limpar_filtros, args=(obra_id,), type="primary", width="stretch")
+
         for ambiente, visiveis in agrupar_por_ambiente(tarefas_filtradas).items():
             itens = grupos.get(ambiente, visiveis)
-            feitas = sum(t["concluida"] for t in itens)
+            feitas_total = sum(t["concluida"] for t in itens)
+            pendentes_v = [t for t in visiveis if not t["concluida"]]
+            feitas_v = [t for t in visiveis if t["concluida"]]
             with st.container(border=True):
-                st.markdown(badge_ambiente(ambiente, feitas, len(itens)), unsafe_allow_html=True)
-                for t in visiveis:
-                    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
-                        st.checkbox(
-                            t["descricao"],
-                            value=bool(t["concluida"]),
-                            key=f"tarefa_{t['id']}",
-                            on_change=_ao_marcar_tarefa,
-                            args=(t["id"],),
-                            width="stretch",
-                        )
-                        with st.popover("✏️ Editar", help="Alterar texto ou ambiente da tarefa"):
-                            with st.form(f"form_edit_tarefa_{t['id']}", enter_to_submit=False, border=False):
-                                e_amb = seletor_ambiente("Ambiente", recomendados, atual=t["ambiente"])
-                                e_desc = st.text_input("Descrição", value=t["descricao"], max_chars=LIM_TAREFA,
-                                                       help="Texto da tarefa.")
-                                if st.form_submit_button("💾 Salvar", type="primary", width="stretch"):
-                                    if desc_ok := sanitize_text(e_desc, LIM_TAREFA):
-                                        db.editar_tarefa(t["id"], sanitize_text(e_amb, LIM_AMBIENTE), desc_ok)
-                                        flash("Tarefa atualizada.")
-                                        st.rerun()
-                                    else:
-                                        st.error("A descrição não pode ficar vazia.")
-                        st.button(
-                            "🗑️ Excluir",
-                            key=f"del_tarefa_{t['id']}",
-                            on_click=_ao_excluir_tarefa,
-                            args=(t["id"], t["descricao"]),
-                            help="Remover esta tarefa do checklist",
-                        )
+                st.markdown(
+                    f"<div class='ot-amb-titulo'>{icone_ambiente(ambiente)} {esc(ambiente, LIM_AMBIENTE)} "
+                    f"{badge(f'{feitas_total}/{len(itens)} concluídas', 'completo' if feitas_total == len(itens) else 'amb')}</div>",
+                    unsafe_allow_html=True,
+                )
+                parcial = " (filtradas)" if len(visiveis) < len(itens) else ""
+                st.markdown(f"<div class='ot-sec ot-sec-pend'>⏳ Pendente / A Fazer ({len(pendentes_v)}){parcial}</div>",
+                            unsafe_allow_html=True)
+                if not pendentes_v:
+                    st.caption("Nada pendente aqui. 🎉" if not parcial else "Nenhuma pendente no filtro atual.")
+                for t in pendentes_v:
+                    linha_tarefa(t)
+                st.markdown(f"<div class='ot-sec ot-sec-ok'>✅ Feito / Concluído ({len(feitas_v)}){parcial}</div>",
+                            unsafe_allow_html=True)
+                if not feitas_v:
+                    st.caption("Nenhum serviço concluído ainda neste ambiente.")
+                for t in feitas_v:
+                    linha_tarefa(t)
 
 
 # --------------------------------------------------------------------------- #
@@ -1127,77 +1439,109 @@ with aba_historico:
     elif not registros_filtrados:
         st.info("Nenhum registro com a busca/filtros atuais.")
     for r in registros_filtrados:  # já vem do mais recente para o mais antigo
-        card_registro(r, tarefas=mapa_tarefas.get(r["id"]), com_acoes=True)
+        card_registro(r, tarefas=mapa_tarefas.get(r["id"]), com_acoes=True, midias=midias_por_registro.get(r["id"]))
 
 
 # --------------------------------------------------------------------------- #
 # Aba 4: Galeria As-Built & Relatório do Cliente
 # --------------------------------------------------------------------------- #
+def form_adicionar_fotos(chave: str, ambiente_fixo: str | None = None) -> None:
+    """Formulário para enviar fotos direto na galeria (num ambiente fixo ou escolhido)."""
+    with st.form(chave, clear_on_submit=True, enter_to_submit=False, border=False):
+        amb = ambiente_fixo or seletor_ambiente("Ambiente", recomendados, key=f"{chave}_amb")
+        opcoes_tarefa = {None: "— Sem tarefa vinculada —"} | {
+            t["id"]: f"{'✅' if t['concluida'] else '⏳'} {t['descricao']}"
+            for t in tarefas if not ambiente_fixo or t["ambiente"] == ambiente_fixo
+        }
+        tarefa_id = st.selectbox("Tarefa vinculada (opcional)", list(opcoes_tarefa), format_func=opcoes_tarefa.get,
+                                 key=f"{chave}_tarefa", help="A foto aparece junto da tarefa no checklist.")
+        titulo = st.text_input("Serviço realizado", max_chars=LIM_TAREFA, key=f"{chave}_titulo",
+                               placeholder="Ex.: Retirada da cerâmica do banheiro",
+                               help="Vira o subtítulo das fotos na galeria. Em branco: usa o texto da tarefa.")
+        descricao = st.text_area("Descrição técnica (opcional)", max_chars=LIMITE_TEXTO_LONGO, key=f"{chave}_desc",
+                                 placeholder="Ex.: tubo de água quente a 30 cm do piso, lado esquerdo")
+        arquivos = st.file_uploader("Fotos", type=TIPOS_FOTO, accept_multiple_files=True, key=f"{chave}_up",
+                                    help=f"Até {MAX_FOTOS_ENVIO} por envio. A localização e os dados do celular são removidos.")
+        if st.form_submit_button("📎 Adicionar fotos", type="primary", width="stretch"):
+            tarefa = next((t for t in tarefas if t["id"] == tarefa_id), None)
+            amb_ok = sanitize_text(amb, LIM_AMBIENTE) or (tarefa["ambiente"] if tarefa else "")
+            if not arquivos:
+                st.error("Escolha ao menos uma foto.")
+            elif not amb_ok:
+                st.error("Escolha o ambiente das fotos.")
+            else:
+                titulo_ok = sanitize_text(titulo, LIM_TAREFA) or (tarefa["descricao"] if tarefa else "Registro fotográfico")
+                n, erros = salvar_fotos(arquivos, obra_id, amb_ok, titulo_ok, descricao, tarefa_id=tarefa_id)
+                for e in erros:
+                    st.warning(e, icon="⚠️")
+                if n:
+                    flash(f"{n} foto(s) adicionada(s) em {amb_ok}.")
+                    st.rerun()
+
+
 with aba_galeria:
     st.subheader(
-        "📐 Galeria As-Built",
-        help="Fotos técnicas com a posição de canos, conduítes e fiação. Consulte antes de furar "
-        "paredes ou pisos: funciona como manual de manutenção da obra.",
+        "🖼️ Galeria da Obra (Por Ambiente e Serviço)",
+        help="Fotos técnicas com a posição de canos, conduítes e fiação, organizadas por cômodo e serviço. "
+        "Consulte antes de furar paredes ou pisos: funciona como manual de manutenção da obra.",
     )
-    todas_fotos = registros_com_foto(registros)
-    fotos = [
-        (r, p, ambientes_do_registro(r, mapa_tarefas, recomendados))
-        for r, p in registros_com_foto(registros_filtrados)
-    ]
+    todas_fotos = midias_com_arquivo(midias_obra)
+    if todas_fotos:
+        st.download_button(
+            "📦 Baixar Fotos da Obra Separadas por Pasta de Ambiente (.ZIP)",
+            # Gerado só no clique: subpastas por ambiente + memorial descritivo.
+            data=partial(gerar_zip_asbuilt, obra, registros, tarefas, midias_obra),
+            file_name=f"fotos_obra_{obra_id}_{date.today():%Y%m%d}.zip",
+            mime="application/zip",
+            width="stretch",
+            type="primary",
+            on_click="ignore",
+            help="Todas as fotos em pastas por cômodo (Banheiro_Social/01_2026-11-11_retirada_da_ceramica.jpg, "
+            "Cozinha/...) e o Memorial_Descritivo_AsBuilt.txt com a descrição técnica de cada foto.",
+        )
+    with st.expander("➕ Adicionar fotos na galeria", expanded=not todas_fotos):
+        form_adicionar_fotos(f"form_galeria_nova_{obra_id}")
+
     if not todas_fotos:
-        st.info("Nenhuma foto técnica ainda. Envie fotos na aba “Novo Registro”, de preferência antes do reboco.")
+        st.info("Nenhuma foto ainda. Envie fotos aqui, na aba “Novo Registro” ou pelo 📷 de cada tarefa do checklist.")
     else:
+        ids_ok = {m["id"] for m in filtrar_midias(midias_obra)}  # busca global + filtros avançados
+        fotos_filtradas = [(m, p) for m, p in todas_fotos if m["id"] in ids_ok]
         g_amb, g_txt = st.columns([1, 2])
-        opcoes_amb_galeria = [TODOS_AMBIENTES, *dict.fromkeys(a for _, _, ambs in fotos for a in ambs)]
+        opcoes_amb_galeria = [TODOS_AMBIENTES, *agrupar_midias(todas_fotos)]
         chave_g_amb = f"galeria_amb_{obra_id}"
         if st.session_state.get(chave_g_amb) not in opcoes_amb_galeria:
             st.session_state[chave_g_amb] = TODOS_AMBIENTES
         amb_galeria = g_amb.selectbox("Ambiente", opcoes_amb_galeria, key=chave_g_amb,
                                       help="Mostra só as fotos de um cômodo.")
         termo_galeria = g_txt.text_input(
-            "Palavra-chave", placeholder="Ex.: água quente, conduíte, 30 cm", key=f"galeria_txt_{obra_id}",
-            max_chars=LIM_BUSCA, help="Procura na descrição técnica, no resumo do dia e nos ambientes da foto.",
+            "Palavra-chave", placeholder="Ex.: cerâmica, água quente, conduíte, 30 cm", key=f"galeria_txt_{obra_id}",
+            max_chars=LIM_BUSCA, help="Procura no ambiente, serviço, descrição técnica, tarefa e relato do dia.",
         )
-        palavras = db.normalizar_busca(sanitize_text(termo_galeria, LIM_BUSCA)).split()
-        fotos = [
-            (r, p, ambs) for r, p, ambs in fotos
-            if (amb_galeria == TODOS_AMBIENTES or amb_galeria in ambs)
-            and all(
-                w in db.normalizar_busca(f"{r.get('mapeamento_asbuilt') or ''} {r.get('resumo_executivo') or ''} {' '.join(ambs)}")
-                for w in palavras
-            )
+        termo_galeria = sanitize_text(termo_galeria, LIM_BUSCA)
+        fotos_filtradas = [
+            (m, p) for m, p in fotos_filtradas
+            if (amb_galeria == TODOS_AMBIENTES or m["ambiente"] == amb_galeria) and midia_corresponde(m, termo_galeria)
         ]
-        st.caption(f"{len(fotos)} de {len(todas_fotos)} foto(s)")
-        if not fotos:
+        st.caption(f"{len(fotos_filtradas)} de {len(todas_fotos)} foto(s)")
+        if not fotos_filtradas:
             st.info("Nenhuma foto com esses filtros.")
-        grade = st.columns(2)
-        for i, (r, foto, ambs) in enumerate(fotos):
-            with grade[i % 2].container(border=True):
-                st.image(str(foto), width="stretch")
-                st.markdown(
-                    f"<span class='ot-data'>📅 {esc(formatar_data(r['data_registro']))}</span><br>"
-                    + "".join(badge_ambiente(a) for a in ambs),
-                    unsafe_allow_html=True,
-                )
-                descricao = r.get("mapeamento_asbuilt") or "-"
-                st.markdown(f"**Mapeamento:** {descricao[:180]}{'…' if len(descricao) > 180 else ''}")
-                st.caption(info_tamanho(r, foto))
-                if st.button("🔍 Ampliar", key=f"ampliar_{r['id']}", width="stretch",
-                             help="Abre a foto em tamanho grande com a descrição técnica completa."):
-                    dialog_foto(r, foto, ambs)
+            st.button("Mostrar todas as fotos", key=f"galeria_mostrar_todas_{obra_id}",
+                      on_click=_limpar_filtros, args=(obra_id,), width="stretch")
 
-        st.download_button(
-            "📦 Baixar Todas as Fotos e Memorial As-Built (.ZIP)",
-            # Gerado só no clique: fotos renomeadas por data/ambiente + memorial descritivo.
-            data=partial(gerar_zip_asbuilt, obra, registros, tarefas),
-            file_name=f"asbuilt_obra_{obra_id}_{date.today():%Y%m%d}.zip",
-            mime="application/zip",
-            width="stretch",
-            type="primary",
-            on_click="ignore",
-            help="Todas as fotos do bloco (01_2026-11-12_Banheiro-Social.jpg...) e o "
-            "Memorial_Descritivo_AsBuilt.txt relacionando cada foto à descrição técnica, para a arquiteta.",
-        )
+        for ambiente, servicos in agrupar_midias(fotos_filtradas).items():
+            qtd = sum(len(v) for v in servicos.values())
+            with st.container(border=True):
+                st.markdown(f"### {icone_ambiente(ambiente)} {esc(ambiente, LIM_AMBIENTE)}")
+                st.caption(f"{qtd} foto(s) · {len(servicos)} serviço(s)")
+                for (servico, data_m), itens in servicos.items():
+                    st.markdown(
+                        f"<div class='ot-servico'>{esc(servico, LIM_TAREFA)} — {esc(formatar_data(data_m))}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    grade_fotos(itens, prefixo=f"gal_{obra_id}")
+                with st.popover(f"➕ Adicionar mais fotos em {ambiente}", width="stretch"):
+                    form_adicionar_fotos(f"form_galeria_{obra_id}_{slug(ambiente, '_')}", ambiente_fixo=ambiente)
 
     st.divider()
     st.subheader(
@@ -1209,7 +1553,7 @@ with aba_galeria:
     st.download_button(
         "📥 Baixar Relatório Completo (.html / Imprimível em PDF)",
         # Gerado só no clique (fotos embutidas deixam o arquivo pesado).
-        data=partial(gerar_relatorio_html, obra, registros, tarefas),
+        data=partial(gerar_relatorio_html, obra, registros, tarefas, midias_obra),
         file_name=f"relatorio_obra_{obra_id}_{date.today():%Y%m%d}.html",
         mime="text/html",
         width="stretch",

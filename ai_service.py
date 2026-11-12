@@ -21,6 +21,8 @@ from google.genai import errors, types
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError
 
+from database import corrigir_ambiente
+
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 
@@ -95,6 +97,19 @@ class ItemTarefa(BaseModel):
     )
 
 
+class ItemFoto(BaseModel):
+    """Classificação de uma foto enviada no registro (na ordem de envio)."""
+
+    indice_foto: int = Field(description="Número da foto na ordem enviada, começando em 1 (FOTO 1, FOTO 2...).")
+    ambiente: str = Field(description="Cômodo mostrado/relacionado à foto (ex.: 'Banheiro Social', 'Cozinha').")
+    titulo_servico: str = Field(
+        description="Serviço documentado na foto, curto e com o cômodo (ex.: 'Retirada da cerâmica do banheiro')."
+    )
+    descricao_tecnica: str = Field(
+        description="O que a foto mostra: tubulações, conduítes, fiação, medidas de referência e etapa da reforma."
+    )
+
+
 class AnaliseDiarioObra(BaseModel):
     """Saída estruturada da análise de um registro diário de obra."""
 
@@ -122,6 +137,10 @@ class AnaliseDiarioObra(BaseModel):
     tarefas_extraidas: list[ItemTarefa] = Field(
         default_factory=list,
         description="Cada atividade mencionada, em um bloco separado por ambiente/cômodo.",
+    )
+    fotos_classificadas: list[ItemFoto] = Field(
+        default_factory=list,
+        description="Uma entrada por foto recebida, indicando ambiente e serviço de cada uma. Vazio se não houver foto.",
     )
 
     # Metadados fora do schema enviado ao Gemini (atributos privados não entram no JSON Schema).
@@ -186,16 +205,20 @@ Regras obrigatórias:
 3) resumo_executivo: serviços executados no dia em linguagem técnica e profissional para o cliente, coerentes com o escopo. Não invente serviços que não foram relatados nem são visíveis.
 4) nivel_produtividade: 'Alta', 'Média' ou 'Baixa', ponderando o volume entregue frente aos imprevistos e ao escopo.
 5) motivo_atraso: chuvas, faltas de funcionários, falta de material ou problemas técnicos que impactaram o prazo, redigidos como justificativa formal (com horários, se citados). Se não houver, escreva exatamente '{SEM_ATRASO}'.
-6) mapeamento_asbuilt: o que a foto mostra — posição e trajeto de tubulações (água fria/quente, esgoto), conduítes, fiação, caixas, ralos, referências de medida (distância do piso, paredes, cantos) e etapa da reforma. Sem foto, use o que o áudio descrever sobre posições; sem nenhuma informação, escreva 'Sem foto para mapeamento As-Built'.
+6) mapeamento_asbuilt: o que as fotos mostram — posição e trajeto de tubulações (água fria/quente, esgoto), conduítes, fiação, caixas, ralos, referências de medida (distância do piso, paredes, cantos) e etapa da reforma. Sem foto, use o que o áudio descrever sobre posições; sem nenhuma informação, escreva 'Sem foto para mapeamento As-Built'.
+7) AMBIENTE (vale para tarefas e fotos): classifique pelo cômodo citado na fala, nas observações ou no escopo. Palavras como banheiro, suíte, lavabo, cozinha, sala, quarto, área de serviço definem o ambiente. Serviços internos — cerâmica, azulejo, piso, porcelanato, revestimento, rejunte, cano, tubulação, hidráulica, ralo, louças, tomadas, fiação — NUNCA são 'Área Externa': se a fala não disser o cômodo, use o cômodo do contexto da conversa ou do escopo da obra. Ex.: "foi retirado a cerâmica do banheiro" → ambiente "Banheiro" (ou "Banheiro Social"), nunca "Área Externa". Use 'Área Externa' só para quintal, jardim, fossa, vala, muro ou calçada.
+8) fotos_classificadas: uma entrada por foto recebida (FOTO 1, FOTO 2...), com o ambiente, um titulo_servico curto que cite o serviço e o cômodo (ex.: "Retirada da cerâmica do banheiro") e a descricao_tecnica do que aquela foto mostra. Sem fotos: lista vazia.
 """
 
 
-def _montar_prompt(contexto_obra: str, observacoes_texto: str, tem_audio: bool, tem_foto: bool) -> str:
+def _montar_prompt(contexto_obra: str, observacoes_texto: str, tem_audio: bool, qtd_fotos: int) -> str:
     fontes = []
     if tem_audio:
         fontes.append("um ÁUDIO com o relato do trabalhador (fonte principal)")
-    if tem_foto:
-        fontes.append("uma FOTO do serviço executado")
+    if qtd_fotos == 1:
+        fontes.append("1 FOTO do serviço executado (FOTO 1)")
+    elif qtd_fotos > 1:
+        fontes.append(f"{qtd_fotos} FOTOS do serviço executado (FOTO 1 a FOTO {qtd_fotos}, na ordem enviada)")
     if observacoes_texto:
         fontes.append("OBSERVAÇÕES escritas")
     fontes_txt = ", ".join(fontes) if fontes else "nenhuma mídia (apenas o contexto)"
@@ -298,30 +321,12 @@ _REGRAS_ATRASO = [
 ]
 _SINAIS_PARALISACAO = r"paramos|parou|paralis|suspens|n[aã]o\s+(?:trabalhamos|deu\s+para|foi\s+poss[ií]vel)|sem\s+trabalho"
 _SINAIS_PENDENTE = r"\b(?:falta|faltou|precisa|amanh[aã]|vamos|vai\s+ser|pendente|ainda\s+n[aã]o|depois)\b"
-_AMBIENTES = [
-    (r"banheiro\s+social", "Banheiro Social"),
-    (r"banheiro\s+(?:da\s+)?su[ií]te|su[ií]te", "Banheiro Suíte"),
-    (r"lavabo", "Lavabo"),
-    (r"banheiro", "Banheiro"),
-    (r"cozinha", "Cozinha"),
-    (r"[aá]rea\s+de\s+servi[cç]o|lavanderia", "Área de Serviço"),
-    (r"\bsala\b", "Sala"),
-    (r"quarto|dormit[oó]rio", "Quarto"),
-    (r"varanda|sacada", "Varanda"),
-    (r"garagem", "Garagem"),
-    (r"fachada", "Fachada"),
-    (r"\bmuro\b", "Muro"),
-    (r"cal[cç]ada", "Calçada"),
-    (r"telhado|laje", "Cobertura"),
-]
+def _tarefas_por_regras(obs: str, contexto_obra: str = "") -> list[ItemTarefa]:
+    """Quebra a observação em atividades (por vírgula, ';', ' e ') e infere o ambiente.
 
-
-def _ambiente_de(texto: str) -> str:
-    return next((nome for padrao, nome in _AMBIENTES if re.search(padrao, texto)), "Geral")
-
-
-def _tarefas_por_regras(obs: str) -> list[ItemTarefa]:
-    """Quebra a observação em atividades (por vírgula, ';', ' e ') e infere o ambiente."""
+    O ambiente vem do cômodo citado no trecho; sem cômodo, de um cômodo citado no resto do
+    relato (serviços internos como cerâmica/piso/cano) ou do escopo da obra.
+    """
     partes = re.split(r"[;,.]|\s+e\s+(?=\w+(?:ei|amos|ou|emos|imos|i)\b)", obs, flags=re.IGNORECASE)
     tarefas = []
     for parte in (p.strip() for p in partes):
@@ -334,7 +339,7 @@ def _tarefas_por_regras(obs: str) -> list[ItemTarefa]:
             continue  # ignora fragmentos e frases que são atraso/paralisação, não atividade
         tarefas.append(
             ItemTarefa(
-                ambiente=_ambiente_de(parte.lower()),
+                ambiente=corrigir_ambiente("Geral", parte, obs, contexto_obra),
                 descricao=parte[0].upper() + parte[1:],
                 concluida=not re.search(_SINAIS_PENDENTE, parte.lower()),
             )
@@ -342,13 +347,26 @@ def _tarefas_por_regras(obs: str) -> list[ItemTarefa]:
     return tarefas
 
 
+def _lista_fotos(fotos: Optional[str | Path | list]) -> list[Path]:
+    if not fotos:
+        return []
+    if isinstance(fotos, (str, Path)):
+        return [Path(fotos)]
+    return [Path(f) for f in fotos if f]
+
+
 def gerar_analise_offline(
     observacoes_texto: str = "",
     contexto_obra: str = "",
     tem_audio: bool = False,
-    caminho_foto: Optional[Path] = None,
+    caminho_foto: Optional[Path | list[Path]] = None,
 ) -> AnaliseDiarioObra:
-    """Gera uma análise estruturada por regras locais, sem chamar a IA."""
+    """Gera uma análise estruturada por regras locais, sem chamar a IA.
+
+    `caminho_foto` aceita uma foto ou uma lista de fotos. As fotos não são classificadas
+    aqui (fotos_classificadas fica vazia); quem salva usa as tarefas para vinculá-las.
+    """
+    fotos = _lista_fotos(caminho_foto)
     obs = (observacoes_texto or "").strip()
     texto = obs.lower()
 
@@ -383,15 +401,11 @@ def gerar_analise_offline(
     if escopo and escopo.lower() != "não informado":
         resumo += f" Serviços enquadrados no escopo contratado: {escopo}"
 
-    if caminho_foto:
-        try:
-            with Image.open(caminho_foto) as img:
-                dims = f"{img.width}×{img.height} px"
-        except Exception:
-            dims = "dimensões indisponíveis"
+    if fotos:
+        qtd = f"{len(fotos)} fotos do dia arquivadas" if len(fotos) > 1 else "Foto do dia arquivada"
         asbuilt = (
-            f"Foto do dia arquivada como evidência As-Built ({dims}). A descrição da posição de "
-            "tubulações, conduítes e fiação pode ser completada editando este registro."
+            f"{qtd} como evidência As-Built. A descrição da posição de tubulações, conduítes e "
+            "fiação pode ser completada na Galeria da Obra ou editando este registro."
         )
     else:
         asbuilt = "Sem foto para mapeamento As-Built"
@@ -409,7 +423,7 @@ def gerar_analise_offline(
         nivel_produtividade=nivel,
         motivo_atraso=motivo,
         mapeamento_asbuilt=asbuilt,
-        tarefas_extraidas=_tarefas_por_regras(obs),
+        tarefas_extraidas=_tarefas_por_regras(obs, contexto_obra),
     )
     analise._modo_offline = True
     analise._aviso = AVISO_ANALISE_SIMPLIFICADA
@@ -419,9 +433,25 @@ def gerar_analise_offline(
 # --------------------------------------------------------------------------- #
 # Função principal
 # --------------------------------------------------------------------------- #
+def _corrigir_ambientes(analise: AnaliseDiarioObra, relato: str, contexto_obra: str, qtd_fotos: int) -> AnaliseDiarioObra:
+    """Aplica as regras de palavras-chave sobre a saída da IA (ex.: cerâmica do banheiro
+    classificada como 'Área Externa' volta para 'Banheiro') e descarta fotos inexistentes."""
+    for t in analise.tarefas_extraidas:
+        t.ambiente = corrigir_ambiente(t.ambiente, t.descricao, relato, contexto_obra)
+    vistas: set[int] = set()
+    fotos = []
+    for f in analise.fotos_classificadas:
+        if 1 <= f.indice_foto <= qtd_fotos and f.indice_foto not in vistas:
+            vistas.add(f.indice_foto)
+            f.ambiente = corrigir_ambiente(f.ambiente, f"{f.titulo_servico} {f.descricao_tecnica}", relato, contexto_obra)
+            fotos.append(f)
+    analise.fotos_classificadas = fotos
+    return analise
+
+
 def processar_registro_obra(
     caminho_audio: Optional[str | Path] = None,
-    caminho_foto: Optional[str | Path] = None,
+    caminho_foto: Optional[str | Path | list] = None,
     observacoes_texto: str = "",
     contexto_obra: str = "",
     modo_offline: Optional[bool] = None,
@@ -433,17 +463,17 @@ def processar_registro_obra(
     Nunca levanta exceção por indisponibilidade da IA — o registro sempre pode ser salvo.
     """
     audio_path = Path(caminho_audio) if caminho_audio else None
-    foto_path = Path(caminho_foto) if caminho_foto else None
+    fotos = _lista_fotos(caminho_foto)
     observacoes_texto = (observacoes_texto or "").strip()
 
-    for p in (audio_path, foto_path):
+    for p in (audio_path, *fotos):
         if p is not None and not p.is_file():
             raise FileNotFoundError(f"Arquivo não encontrado: {p}")
-    if not (audio_path or foto_path or observacoes_texto):
+    if not (audio_path or fotos or observacoes_texto):
         raise ValueError("Envie pelo menos um áudio, uma foto ou observações em texto.")
 
     def offline() -> AnaliseDiarioObra:
-        return gerar_analise_offline(observacoes_texto, contexto_obra, audio_path is not None, foto_path)
+        return gerar_analise_offline(observacoes_texto, contexto_obra, audio_path is not None, fotos)
 
     if modo_offline if modo_offline is not None else modo_offline_forcado():
         return offline()
@@ -468,12 +498,14 @@ def processar_registro_obra(
         if audio_path:
             parte_audio, arquivo_remoto = _parte_audio(client, audio_path)
             contents.append(parte_audio)
-        if foto_path:
-            contents.append(_carregar_foto(foto_path))
+        for i, foto in enumerate(fotos, start=1):
+            contents += [f"FOTO {i}:", _carregar_foto(foto)]
         contents.append(
-            _montar_prompt(contexto_obra, observacoes_texto, tem_audio=audio_path is not None, tem_foto=foto_path is not None)
+            _montar_prompt(contexto_obra, observacoes_texto, tem_audio=audio_path is not None, qtd_fotos=len(fotos))
         )
         analise = _gerar_com_fallback(client, contents)
+        relato = f"{analise.transcricao_audio} {observacoes_texto}"
+        analise = _corrigir_ambientes(analise, relato, contexto_obra, len(fotos))
         log.info("Registro analisado com %s.", analise.modelo)
         return analise
     except errors.APIError as exc:

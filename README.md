@@ -22,21 +22,25 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
 ## 2. A solução
 
 1. **Bloco de Cliente/Obra**: cada obra é um "bloco" com cliente, endereço, escopo e status. Os blocos ficam na barra lateral, com busca rápida por cliente ou endereço e o botão **➕ Criar Novo Bloco de Cliente**. Sem bloco aberto, a tela inicial mostra o cadastro em destaque e atalhos para as obras; o bloco recém-criado abre automaticamente.
-   - **Busca Global na Obra**: procura em tarefas, transcrições, canos, materiais e atrasos, sem diferenciar maiúsculas nem acentos. Os **filtros avançados** combinam ambiente, status da tarefa, produtividade, intervalo de datas e "apenas dias com atraso", e valem para o checklist, o histórico e a galeria. A busca roda no SQLite.
-2. **Novo Registro**: grava o áudio pelo navegador do celular, anexa a foto e escreve uma observação opcional.
-3. **IA multimodal (Gemini 3.x Flash)**: cruza o relato, a foto e o **contexto da obra** e devolve um JSON validado:
+   - **Busca Global na Obra**: procura em ambiente, tarefa, transcrição e resumo do dia, atrasos e serviço das fotos, sem diferenciar maiúsculas nem acentos. Os **filtros avançados** combinam ambiente, status da tarefa, produtividade, intervalo de datas e "apenas dias com atraso", e valem para o checklist, o histórico e a galeria. O botão **✖️ Limpar Filtros**, ao lado da busca, zera tudo de uma vez.
+2. **Novo Registro**: grava o áudio pelo navegador do celular, anexa **uma ou várias fotos** e uma observação opcional. Cada foto vai para a Galeria já no ambiente e no serviço do relato ("foi retirado a cerâmica do banheiro" + 2 fotos → 2 fotos em **Banheiro**, serviço "Retirada da cerâmica...").
+3. **IA multimodal (Gemini 3.x Flash)**: cruza o relato, as fotos e o **contexto da obra** e devolve um JSON validado:
    - `transcricao_audio`: transcrição literal e completa do relato;
    - `tarefas_extraidas`: cada atividade falada vira um bloco **por cômodo** ("tirei a cerâmica do banheiro social e passei cano na cozinha" → 2 tarefas), marcada como feita ou pendente;
    - `resumo_executivo`: atividades do dia em linguagem técnica para a cliente;
    - `nivel_produtividade`: Alta, Média ou Baixa (entregas versus imprevistos);
    - `motivo_atraso`: chuva, faltas ou problemas técnicos, redigidos como justificativa de prazo;
-   - `mapeamento_asbuilt`: descrição técnica da foto (posição e trajeto de tubulações, alturas, referências).
-4. **Checklist por Ambiente**: as tarefas extraídas alimentam um checklist interativo agrupado por cômodo, com barra de progresso da obra, inclusão manual, edição e exclusão.
+   - `mapeamento_asbuilt`: descrição técnica das fotos (posição e trajeto de tubulações, alturas, referências);
+   - `fotos_classificadas`: ambiente, título do serviço e descrição técnica de **cada foto**.
+
+   **Ambiente sempre pelo cômodo citado**: palavras como banheiro, suíte, cozinha, sala, quarto definem o ambiente; serviços internos (cerâmica, piso, azulejo, cano, hidráulica, fiação) nunca ficam em "Área Externa". A regra está no prompt e é aplicada de novo sobre a resposta da IA e na análise offline (`database.corrigir_ambiente`). "Área Externa" fica para quintal, fossa, vala, muro e calçada.
+4. **Checklist por Ambiente**: as tarefas extraídas alimentam um checklist interativo agrupado por cômodo (🚿 Banheiro, 🍳 Cozinha...). Em cada cômodo, **⏳ Pendente / A Fazer** e **✅ Feito / Concluído** ficam separados; um toque no checkbox já move a tarefa de seção. Cada tarefa tem ✏️ editar (texto e ambiente; as fotos acompanham a troca), 📷 anexar fotos e 🗑️ excluir. O formulário **➕ Adicionar tarefa** também aceita fotos. Se um filtro esconder tarefas, aparece um aviso com o botão **Mostrar todas as X tarefas da obra**.
    Contadores por cômodo ("Banheiro Social: 3/4 concluídas"). **Recomendação inteligente de ambientes**: os cômodos mais usados nesta obra e nas outras (vindos dos áudios ou digitados) aparecem no topo, seguidos dos ambientes base. Também é possível digitar um ambiente novo.
-5. **Histórico e Diários**: linha do tempo por obra com player do áudio original, badge de produtividade, alertas de atraso e foto ao lado do As-Built. Cada registro pode ser editado (para corrigir a transcrição, por exemplo) ou excluído com confirmação.
-6. **Galeria As-Built & Relatório do Cliente**:
-   - **Galeria As-Built**: só as fotos técnicas, em grade, com data, ambiente, mapeamento de canos e fiação e o tamanho economizado pela compressão. Tem filtro por ambiente ou palavra-chave e um botão **🔍 Ampliar** que abre a foto grande com a descrição completa. Funciona como manual de manutenção da obra.
-   - **📦 ZIP para a arquiteta**: todas as fotos do bloco renomeadas só dentro do ZIP (`01_2026-11-12_Banheiro-Social.jpg`), mais o `Memorial_Descritivo_AsBuilt.txt`, que liga cada foto à sua descrição técnica, ao histórico e ao checklist. O ZIP é gerado em memória, na hora do clique.
+5. **Histórico e Diários**: linha do tempo por obra com player do áudio original, badge de produtividade, alertas de atraso e as fotos do dia. Cada registro pode ser editado (para corrigir a transcrição, por exemplo) ou excluído com confirmação (tarefas e fotos podem ser mantidas na obra).
+6. **🖼️ Galeria da Obra & Relatórios**:
+   - **Galeria por ambiente e serviço**: as fotos ficam na tabela `midias_obra`, ligadas a ambiente, serviço e, quando houver, ao registro e à tarefa. Cada cômodo é um bloco com título em destaque (`🚿 Banheiro`); dentro dele, cada serviço tem um subtítulo (*Retirada da cerâmica do banheiro — 11/11/2026*) e a grade das fotos, com 🔍 ampliar, ✏️ editar ambiente/serviço/descrição e 🗑️ excluir. Há botões para adicionar fotos em qualquer ambiente, e filtros por ambiente e palavra-chave. Funciona como manual de manutenção da obra.
+   - **📦 ZIP para a arquiteta**: as fotos vêm em subpastas por ambiente (`Banheiro_Social/01_2026-11-11_retirada_da_ceramica.jpg`, `Cozinha/...`), mais o `Memorial_Descritivo_AsBuilt.txt` com a descrição de cada foto, o histórico e o checklist. O ZIP é gerado em memória, na hora do clique.
+   - **Migração automática**: fotos de registros antigos entram em `midias_obra` ao iniciar o app, no ambiente das tarefas daquele registro (ou do cômodo citado no texto/escopo, em vez de "Área Externa" genérica).
    - **Resumo para WhatsApp**: texto pronto para copiar, com barra de progresso, serviços concluídos por cômodo e justificativas formais de atraso.
    - **Relatório completo**: HTML autocontido e estilizado para impressão (checklist, justificativas, galeria e diário), pronto para salvar em PDF.
 

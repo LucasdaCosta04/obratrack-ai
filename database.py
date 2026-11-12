@@ -6,7 +6,7 @@ import os
 import sqlite3
 import warnings
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -143,6 +143,23 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_registros_obra_id
                 ON registros_diarios (obra_id);
+
+            -- Checklist de tarefas por ambiente. Excluir a obra apaga as tarefas;
+            -- excluir o registro de origem apenas desvincula a tarefa (registro_id -> NULL).
+            CREATE TABLE IF NOT EXISTS tarefas_obra (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                obra_id       INTEGER NOT NULL,
+                registro_id   INTEGER,
+                ambiente      TEXT NOT NULL DEFAULT 'Geral',
+                descricao     TEXT NOT NULL,
+                concluida     INTEGER NOT NULL DEFAULT 0 CHECK (concluida IN (0, 1)),
+                data_criacao  TEXT NOT NULL,
+                FOREIGN KEY (obra_id) REFERENCES clientes_obras (id) ON DELETE CASCADE,
+                FOREIGN KEY (registro_id) REFERENCES registros_diarios (id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tarefas_obra_id ON tarefas_obra (obra_id);
+            CREATE INDEX IF NOT EXISTS idx_tarefas_registro_id ON tarefas_obra (registro_id);
             """
         )
         _migrar(conn)
@@ -154,8 +171,77 @@ def _migrar(conn: sqlite3.Connection) -> None:
     colunas = {row["name"] for row in conn.execute("PRAGMA table_info(registros_diarios)")}
     if "caminho_audio" not in colunas:
         conn.execute("ALTER TABLE registros_diarios ADD COLUMN caminho_audio TEXT")
+    _sanear_textos_legados(conn)
 
 
+# Frases geradas pelo antigo "Modo Demonstração" que expunham detalhes técnicos ao usuário.
+# Só essas frases exatas (produzidas pelo próprio app) são reescritas.
+_TRANSCRICAO_NOVA = (
+    "Transcrição automática indisponível para este registro. Ouça o relato original no "
+    "player ou edite o registro para incluir a transcrição."
+)
+_SUBSTITUICOES_LEGADAS = [
+    ("transcricao_audio",
+     "[Modo Demonstração] Áudio gravado e arquivado no registro; a transcrição automática requer a GEMINI_API_KEY no servidor. Ouça o relato original no player.",
+     _TRANSCRICAO_NOVA),
+    ("transcricao_audio",
+     "[Modo Demonstração] Áudio gravado e arquivado no registro; a transcrição automática requer a GEMINI_API_KEY. Ouça o relato original no player.",
+     _TRANSCRICAO_NOVA),
+    ("mapeamento_asbuilt",
+     "A identificação automática de tubulações, conduítes e fiação requer a análise de IA (GEMINI_API_KEY no servidor).",
+     "A descrição da posição de tubulações, conduítes e fiação pode ser completada editando este registro."),
+    ("mapeamento_asbuilt",
+     "A identificação automática de tubulações, conduítes e fiação requer a análise de IA (configure a GEMINI_API_KEY).",
+     "A descrição da posição de tubulações, conduítes e fiação pode ser completada editando este registro."),
+    ("resumo_executivo", "[Modo Demonstração] ", ""),
+]
+
+
+def _sanear_textos_legados(conn: sqlite3.Connection) -> None:
+    """Migração idempotente: remove de registros antigos as menções técnicas do modo offline."""
+    for coluna, antigo, novo in _SUBSTITUICOES_LEGADAS:
+        conn.execute(
+            f"UPDATE registros_diarios SET {coluna} = REPLACE({coluna}, ?, ?) WHERE instr({coluna}, ?) > 0",
+            (antigo, novo, antigo),
+        )
+
+
+def _validar_status(status: str) -> None:
+    if status not in STATUS_OBRA:
+        raise ValueError(f"Status inválido: {status!r}. Use um de {STATUS_OBRA}.")
+
+
+def _validar_nivel(nivel: Optional[str]) -> None:
+    if nivel is not None and nivel not in NIVEIS_PRODUTIVIDADE:
+        raise ValueError(f"Nível de produtividade inválido: {nivel!r}. Use um de {NIVEIS_PRODUTIVIDADE}.")
+
+
+def _remover_midias_orfas(conn: sqlite3.Connection, caminhos: list[Optional[str]]) -> int:
+    """Apaga do disco as mídias que nenhum registro referencia mais.
+
+    Só remove arquivos dentro de uploads\\ (caminho_midia_seguro). Deve ser chamada
+    depois do DELETE, na mesma conexão, para enxergar o estado já atualizado.
+    """
+    removidos = 0
+    for caminho in {c for c in caminhos if c}:
+        ainda_usado = conn.execute(
+            "SELECT 1 FROM registros_diarios WHERE caminho_foto = ? OR caminho_audio = ? LIMIT 1",
+            (caminho, caminho),
+        ).fetchone()
+        arquivo = caminho_midia_seguro(caminho)
+        if ainda_usado or arquivo is None or not arquivo.is_file():
+            continue
+        try:
+            arquivo.unlink()
+            removidos += 1
+        except OSError:
+            pass  # arquivo em uso (ex.: aberto no player); fica para uma limpeza futura
+    return removidos
+
+
+# --------------------------------------------------------------------------- #
+# Obras (Blocos de Clientes)
+# --------------------------------------------------------------------------- #
 def listar_obras() -> list[dict]:
     """Retorna todas as obras, das mais recentes para as mais antigas."""
     with get_connection() as conn:
@@ -173,8 +259,7 @@ def criar_obra(
     data_inicio: Optional[str] = None,
 ) -> int:
     """Cria uma nova obra e retorna o seu id."""
-    if status not in STATUS_OBRA:
-        raise ValueError(f"Status inválido: {status!r}. Use um de {STATUS_OBRA}.")
+    _validar_status(status)
     data_inicio = data_inicio or date.today().isoformat()
     with get_connection() as conn:
         cur = conn.execute(
@@ -187,6 +272,52 @@ def criar_obra(
         return int(cur.lastrowid)
 
 
+def editar_obra(
+    obra_id: int,
+    nome_cliente: str,
+    endereco: str,
+    escopo_resumo: str,
+    status: str,
+    data_inicio: str,
+) -> bool:
+    """Atualiza os dados de uma obra. Retorna False se ela não existir."""
+    _validar_status(status)
+    if not nome_cliente.strip():
+        raise ValueError("O nome da cliente/obra é obrigatório.")
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE clientes_obras
+            SET nome_cliente = ?, endereco = ?, escopo_resumo = ?, status = ?, data_inicio = ?
+            WHERE id = ?
+            """,
+            (nome_cliente.strip(), endereco, escopo_resumo, status, data_inicio, obra_id),
+        )
+        return cur.rowcount > 0
+
+
+def excluir_obra(obra_id: int) -> bool:
+    """Exclui a obra com todos os seus registros, tarefas e mídias. Retorna False se não existir."""
+    with get_connection() as conn:
+        midias = [
+            c
+            for row in conn.execute(
+                "SELECT caminho_foto, caminho_audio FROM registros_diarios WHERE obra_id = ?", (obra_id,)
+            )
+            for c in (row["caminho_foto"], row["caminho_audio"])
+        ]
+        # Exclusão explícita (não depende de ON DELETE CASCADE em bancos antigos).
+        conn.execute("DELETE FROM tarefas_obra WHERE obra_id = ?", (obra_id,))
+        conn.execute("DELETE FROM registros_diarios WHERE obra_id = ?", (obra_id,))
+        cur = conn.execute("DELETE FROM clientes_obras WHERE id = ?", (obra_id,))
+        if cur.rowcount:
+            _remover_midias_orfas(conn, midias)
+        return cur.rowcount > 0
+
+
+# --------------------------------------------------------------------------- #
+# Registros diários
+# --------------------------------------------------------------------------- #
 def inserir_registro(
     obra_id: int,
     transcricao_audio: str = "",
@@ -199,11 +330,7 @@ def inserir_registro(
     data_registro: Optional[str] = None,
 ) -> int:
     """Insere um registro diário vinculado a uma obra e retorna o seu id."""
-    if nivel_produtividade is not None and nivel_produtividade not in NIVEIS_PRODUTIVIDADE:
-        raise ValueError(
-            f"Nível de produtividade inválido: {nivel_produtividade!r}. "
-            f"Use um de {NIVEIS_PRODUTIVIDADE}."
-        )
+    _validar_nivel(nivel_produtividade)
     data_registro = data_registro or date.today().isoformat()
     # Só aceita mídias dentro de uploads\ (impede gravar caminhos para arquivos arbitrários do disco).
     for rotulo, caminho in (("foto", caminho_foto), ("áudio", caminho_audio)):
@@ -252,6 +379,140 @@ def listar_registros_por_obra(obra_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def atualizar_registro_diario(
+    registro_id: int,
+    data_registro: str,
+    transcricao_audio: str,
+    resumo_executivo: str,
+    nivel_produtividade: str,
+    motivo_atraso: str,
+    mapeamento_asbuilt: str,
+) -> bool:
+    """Atualiza os campos textuais de um registro (mídias não mudam). False se não existir."""
+    _validar_nivel(nivel_produtividade)
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE registros_diarios
+            SET data_registro = ?, transcricao_audio = ?, resumo_executivo = ?,
+                nivel_produtividade = ?, motivo_atraso = ?, mapeamento_asbuilt = ?
+            WHERE id = ?
+            """,
+            (
+                data_registro,
+                transcricao_audio,
+                resumo_executivo,
+                nivel_produtividade,
+                motivo_atraso,
+                mapeamento_asbuilt,
+                registro_id,
+            ),
+        )
+        return cur.rowcount > 0
+
+
+def excluir_registro_diario(registro_id: int, excluir_tarefas: bool = False) -> bool:
+    """Exclui um registro diário e apaga com segurança suas mídias órfãs em uploads\\.
+
+    Tarefas extraídas desse registro são excluídas (`excluir_tarefas=True`) ou mantidas
+    no checklist, desvinculadas (padrão). Retorna False se o registro não existir.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT caminho_foto, caminho_audio FROM registros_diarios WHERE id = ?", (registro_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        if excluir_tarefas:
+            conn.execute("DELETE FROM tarefas_obra WHERE registro_id = ?", (registro_id,))
+        else:
+            conn.execute("UPDATE tarefas_obra SET registro_id = NULL WHERE registro_id = ?", (registro_id,))
+        conn.execute("DELETE FROM registros_diarios WHERE id = ?", (registro_id,))
+        _remover_midias_orfas(conn, [row["caminho_foto"], row["caminho_audio"]])
+        return True
+
+
+# --------------------------------------------------------------------------- #
+# Checklist de tarefas
+# --------------------------------------------------------------------------- #
+def _normalizar_ambiente(ambiente: Optional[str]) -> str:
+    return (ambiente or "").strip() or "Geral"
+
+
+def inserir_tarefa(
+    obra_id: int,
+    registro_id: Optional[int],
+    ambiente: str,
+    descricao: str,
+    concluida: int | bool = 1,
+) -> int:
+    """Insere uma tarefa no checklist da obra e retorna o seu id."""
+    if not descricao or not descricao.strip():
+        raise ValueError("A descrição da tarefa é obrigatória.")
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO tarefas_obra (obra_id, registro_id, ambiente, descricao, concluida, data_criacao)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                obra_id,
+                registro_id,
+                _normalizar_ambiente(ambiente),
+                descricao.strip(),
+                1 if concluida else 0,
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def listar_tarefas_obra(obra_id: int) -> list[dict]:
+    """Tarefas da obra ordenadas por ambiente; pendentes antes das concluídas."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, obra_id, registro_id, ambiente, descricao, concluida, data_criacao
+            FROM tarefas_obra
+            WHERE obra_id = ?
+            ORDER BY ambiente COLLATE NOCASE, concluida, id
+            """,
+            (obra_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def alternar_status_tarefa(tarefa_id: int, concluida: int | bool) -> bool:
+    """Marca a tarefa como concluída (1) ou pendente (0). False se não existir."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE tarefas_obra SET concluida = ? WHERE id = ?", (1 if concluida else 0, tarefa_id)
+        )
+        return cur.rowcount > 0
+
+
+def editar_tarefa(tarefa_id: int, ambiente: str, descricao: str) -> bool:
+    """Altera ambiente e descrição de uma tarefa. False se não existir."""
+    if not descricao or not descricao.strip():
+        raise ValueError("A descrição da tarefa é obrigatória.")
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE tarefas_obra SET ambiente = ?, descricao = ? WHERE id = ?",
+            (_normalizar_ambiente(ambiente), descricao.strip(), tarefa_id),
+        )
+        return cur.rowcount > 0
+
+
+def excluir_tarefa(tarefa_id: int) -> bool:
+    """Exclui uma tarefa do checklist. False se não existir."""
+    with get_connection() as conn:
+        cur = conn.execute("DELETE FROM tarefas_obra WHERE id = ?", (tarefa_id,))
+        return cur.rowcount > 0
+
+
+# --------------------------------------------------------------------------- #
+# Seed
+# --------------------------------------------------------------------------- #
 def seed_data() -> None:
     """Insere obras de exemplo apenas se a tabela estiver vazia."""
     with get_connection() as conn:

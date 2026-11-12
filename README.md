@@ -22,15 +22,17 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
 ## 2. A solução
 
 1. **Bloco de Cliente/Obra**: cada obra é um "bloco" com cliente, endereço, escopo e status.
-2. **Registrar Dia**: grava o áudio pelo navegador do celular, anexa a foto e escreve uma observação opcional.
-3. **IA multimodal (Gemini 3.8 Flash)**: cruza o relato, a foto e o **contexto da obra** e devolve um JSON validado:
-   - `transcricao_audio`: transcrição fiel do relato;
+2. **Novo Registro**: grava o áudio pelo navegador do celular, anexa a foto e escreve uma observação opcional.
+3. **IA multimodal (Gemini 3.x Flash)**: cruza o relato, a foto e o **contexto da obra** e devolve um JSON validado:
+   - `transcricao_audio`: transcrição literal e completa do relato;
+   - `tarefas_extraidas`: cada atividade falada vira um bloco **por cômodo** ("tirei a cerâmica do banheiro social e passei cano na cozinha" → 2 tarefas), marcada como feita ou pendente;
    - `resumo_executivo`: atividades do dia em linguagem técnica para a cliente;
    - `nivel_produtividade`: Alta, Média ou Baixa (entregas versus imprevistos);
    - `motivo_atraso`: chuva, faltas ou problemas técnicos, redigidos como justificativa de prazo;
    - `mapeamento_asbuilt`: descrição técnica da foto (posição e trajeto de tubulações, alturas, referências).
-4. **Histórico e As-Built**: linha do tempo por obra, com badge de produtividade, alertas de atraso e foto ao lado do mapeamento.
-5. **Relatório para o Cliente**: consolida as justificativas de atraso e as fotos em um HTML autocontido, pronto para enviar ou imprimir em PDF.
+4. **Checklist por Ambiente**: as tarefas extraídas alimentam um checklist interativo agrupado por cômodo, com barra de progresso da obra, inclusão manual, edição e exclusão.
+5. **Histórico e Diários**: linha do tempo por obra com player do áudio original, badge de produtividade, alertas de atraso e foto ao lado do As-Built. Cada registro pode ser editado (para corrigir a transcrição, por exemplo) ou excluído com confirmação.
+6. **Relatório para o Cliente**: consolida justificativas de atraso, checklist e fotos num HTML autocontido, pronto para enviar ou imprimir em PDF.
 
 ### Indicadores do bloco
 - **Total de Registros**: disciplina de documentação da equipe.
@@ -43,24 +45,28 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
  Celular / navegador (Streamlit, layout mobile-first)
    │  st.audio_input (voz) · st.file_uploader (foto) · texto
    ▼
- app.py ──────────── salva mídia em uploads\obra_<id>\<tipo>_<timestamp>_<uuid>.ext
+ app.py ──────────── salva mídia em uploads\<tipo>_<timestamp>.ext
    │
-   ├──► ai_service.py ── google-genai ──► Gemini 3.8 Flash
+   ├──► ai_service.py ── google-genai ──► cadeia de modelos Gemini
+   │        • 3.8 → 3.7 → 3.6 → 3.5 Flash → 2.x (503/429: retry em 2 s; 404/504: próximo modelo)
    │        • áudio ≤15 MB inline (Part.from_bytes); maior → Files API
    │        • foto via PIL (corrige rotação EXIF)
    │        • prompt com o contexto da obra (escopo, endereço, status)
-   │        • response_schema = AnaliseDiarioObra (Pydantic), temperature 0.2
+   │        • response_schema = AnaliseDiarioObra + list[ItemTarefa] (Pydantic), temperature 0.2
+   │        • todos falharam → análise offline por regras (o registro nunca se perde)
    │        ◄── JSON validado
    │
    └──► database.py ── SQLite (obratrack.db)
             clientes_obras (1) ───< registros_diarios (N)
+                   │                       │ (SET NULL ao excluir o registro)
+                   └──────< tarefas_obra (N) >┘
 ```
 
 | Camada | Arquivo | Responsabilidade |
 |---|---|---|
-| Interface | `app.py` | Blocos de obra, gravação de áudio, histórico, relatório HTML |
-| IA | `ai_service.py` | Montagem multimodal, prompt de domínio, saída estruturada (Pydantic) |
-| Dados | `database.py` | Schema SQLite com FK e CHECK constraints, CRUD, seed de exemplo |
+| Interface | `app.py` | Blocos de obra, gravação de áudio, checklist, histórico com edição e exclusão, relatório HTML |
+| IA | `ai_service.py` | Montagem multimodal, prompt de domínio, saída estruturada (Pydantic), cadeia de modelos, análise offline |
+| Dados | `database.py` | Schema SQLite com FK e CHECK constraints, migrações, CRUD completo, limpeza de mídias órfãs |
 
 **Decisões de produto e engenharia**
 - **Saída estruturada com Pydantic**: o modelo é obrigado a responder no schema, e `nivel_produtividade` é um `Literal` com os mesmos valores aceitos pelo banco (`CHECK`). Nada de interpretar texto livre.
@@ -69,7 +75,8 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
 - **`pathlib.Path` em todo o projeto**: caminhos relativos no banco e compatibilidade total com Windows.
 - **Chave de API somente no backend**: a `GEMINI_API_KEY` é lida apenas do ambiente do servidor (variável de ambiente ou `.env`). A interface não recebe nem exibe a chave.
 - **Banco e mídias confinados ao diretório local**: o `obratrack.db` e a pasta `uploads\` são validados para ficarem dentro do projeto, fora de unidades de rede, e só são aceitas mídias de dentro de `uploads\`.
-- **Modo Demonstração**: sem chave válida, o registro é salvo com uma análise por regras locais, sem travar o fluxo.
+- **Resiliência a 503**: o retry interno do SDK é desligado e a aplicação percorre uma cadeia de modelos. Se todos falharem, o registro é salvo com uma análise por regras locais e o usuário pode editá-lo depois. Detalhes técnicos vão só para o log do servidor; a interface nunca menciona chave, modelos ou configuração.
+- **Configuração do servidor**: `GEMINI_API_KEY` (obrigatória para IA), `OBRATRACK_MODELOS` (ordem da cadeia, separada por vírgula) e `OBRATRACK_MODO_OFFLINE=1` (força a análise offline em testes).
 
 ## 4. Como rodar (Windows PowerShell)
 

@@ -31,13 +31,18 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
    - `motivo_atraso`: chuva, faltas ou problemas técnicos, redigidos como justificativa de prazo;
    - `mapeamento_asbuilt`: descrição técnica da foto (posição e trajeto de tubulações, alturas, referências).
 4. **Checklist por Ambiente**: as tarefas extraídas alimentam um checklist interativo agrupado por cômodo, com barra de progresso da obra, inclusão manual, edição e exclusão.
+   Filtros rápidos por status (Todas, Pendentes, Concluídas) e por ambiente, com contadores por cômodo ("Banheiro Social: 3/4 concluídas").
 5. **Histórico e Diários**: linha do tempo por obra com player do áudio original, badge de produtividade, alertas de atraso e foto ao lado do As-Built. Cada registro pode ser editado (para corrigir a transcrição, por exemplo) ou excluído com confirmação.
-6. **Relatório para o Cliente**: consolida justificativas de atraso, checklist e fotos num HTML autocontido, pronto para enviar ou imprimir em PDF.
+6. **Galeria As-Built & Relatório do Cliente**:
+   - **Galeria As-Built**: só as fotos técnicas, em grade, com a data e o mapeamento de canos e fiação. Funciona como manual de manutenção da obra.
+   - **Resumo para WhatsApp**: texto pronto para copiar, com barra de progresso, serviços concluídos por cômodo e justificativas formais de atraso.
+   - **Relatório completo**: HTML autocontido e estilizado para impressão (checklist, justificativas, galeria e diário), pronto para salvar em PDF.
 
 ### Indicadores do bloco
-- **Total de Registros**: disciplina de documentação da equipe.
-- **Dias com Atraso Justificado**: base para pedir aditivo de prazo.
-- **Produtividade Predominante**: saúde da obra num só número.
+- **Progresso**: percentual de tarefas do checklist concluídas.
+- **Total de Tarefas**: tamanho do checklist da obra.
+- **Dias Trabalhados**: dias distintos com registro no diário.
+- **Alertas de Atraso**: dias com atraso justificado, base para pedir aditivo de prazo.
 
 ## 3. Arquitetura
 
@@ -45,7 +50,7 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
  Celular / navegador (Streamlit, layout mobile-first)
    │  st.audio_input (voz) · st.file_uploader (foto) · texto
    ▼
- app.py ──────────── salva mídia em uploads\<tipo>_<timestamp>.ext
+ app.py ── security.py: valida magic bytes, remove EXIF/GPS, salva em uploads\<uuid4>.ext
    │
    ├──► ai_service.py ── google-genai ──► cadeia de modelos Gemini
    │        • 3.8 → 3.7 → 3.6 → 3.5 Flash → 2.x (503/429: retry em 2 s; 404/504: próximo modelo)
@@ -66,7 +71,8 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
 |---|---|---|
 | Interface | `app.py` | Blocos de obra, gravação de áudio, checklist, histórico com edição e exclusão, relatório HTML |
 | IA | `ai_service.py` | Montagem multimodal, prompt de domínio, saída estruturada (Pydantic), cadeia de modelos, análise offline |
-| Dados | `database.py` | Schema SQLite com FK e CHECK constraints, migrações, CRUD completo, limpeza de mídias órfãs |
+| Dados | `database.py` | Schema SQLite com FK, CHECK constraints e WAL, migrações, CRUD completo, limpeza de mídias órfãs |
+| Segurança | `security.py` | Remoção de EXIF/GPS, validação de mídia por magic bytes, nomes UUID, higienização de textos, PIN de acesso |
 
 **Decisões de produto e engenharia**
 - **Saída estruturada com Pydantic**: o modelo é obrigado a responder no schema, e `nivel_produtividade` é um `Literal` com os mesmos valores aceitos pelo banco (`CHECK`). Nada de interpretar texto livre.
@@ -76,7 +82,13 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
 - **Chave de API somente no backend**: a `GEMINI_API_KEY` é lida apenas do ambiente do servidor (variável de ambiente ou `.env`). A interface não recebe nem exibe a chave.
 - **Banco e mídias confinados ao diretório local**: o `obratrack.db` e a pasta `uploads\` são validados para ficarem dentro do projeto, fora de unidades de rede, e só são aceitas mídias de dentro de `uploads\`.
 - **Resiliência a 503**: o retry interno do SDK é desligado e a aplicação percorre uma cadeia de modelos. Se todos falharem, o registro é salvo com uma análise por regras locais e o usuário pode editá-lo depois. Detalhes técnicos vão só para o log do servidor; a interface nunca menciona chave, modelos ou configuração.
-- **Configuração do servidor**: `GEMINI_API_KEY` (obrigatória para IA), `OBRATRACK_MODELOS` (ordem da cadeia, separada por vírgula) e `OBRATRACK_MODO_OFFLINE=1` (força a análise offline em testes).
+- **Privacidade das fotos**: toda foto é regravada a partir apenas dos pixels. Saem GPS (endereço da cliente), data/hora original, modelo do celular, XMP e ICC; a rotação é aplicada antes. As miniaturas do relatório passam pelo mesmo processo.
+- **Upload validado pelo conteúdo**: áudio só WAV, MP3 ou OGG e foto só JPEG ou PNG, reconhecidos pelos magic bytes e não pela extensão. Limite de 15 MB, também no servidor (`server.maxUploadSize`). O arquivo é salvo como `uploads\<uuid4>.<ext>`, sem nome original, nome do cliente ou data.
+- **Textos higienizados**: entradas com `strip`, sem caracteres de controle e com limite de tamanho. Todo texto inserido em HTML customizado passa por `html.escape`, contra XSS nos cards e no relatório.
+- **PIN de acesso opcional** (`APP_PIN`): sem o PIN nenhum dado de cliente é renderizado. Após 5 erros, a origem fica bloqueada por 5 minutos, mesmo recarregando a página. A comparação usa `hmac.compare_digest`.
+- **SQLite com `foreign_keys = ON` e `journal_mode = WAL`** em todas as conexões, para integridade transacional.
+- **Interface sem menus técnicos**: `.streamlit/config.toml` com `toolbarMode = "minimal"`, `showErrorDetails = "none"` (sem traceback na tela) e `gatherUsageStats = false`. O CSS esconde o menu, o rodapé e o botão Deploy.
+- **Configuração do servidor**: `GEMINI_API_KEY` (obrigatória para IA), `APP_PIN` (opcional), `OBRATRACK_MODELOS` (ordem da cadeia, separada por vírgula) e `OBRATRACK_MODO_OFFLINE=1` (força a análise offline em testes).
 
 ## 4. Como rodar (Windows PowerShell)
 
@@ -113,6 +125,9 @@ obratrack-ai\
 ├── app.py            # Interface Streamlit
 ├── ai_service.py     # Integração Gemini (multimodal + schema)
 ├── database.py       # SQLite: schema, CRUD e seed
+├── security.py       # EXIF/GPS, validação de mídia, UUID, sanitização, PIN
+├── .streamlit\
+│   └── config.toml   # menus técnicos ocultos, limite de upload, tema
 ├── requirements.txt
 ├── .env.example
 ├── obratrack.db      # gerado (ignorado no git)

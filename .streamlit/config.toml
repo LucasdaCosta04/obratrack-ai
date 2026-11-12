@@ -1,0 +1,19 @@
+[client]
+# Esconde o menu técnico do Streamlit (rerun, configurações, "Deploy") para o usuário final.
+toolbarMode = "minimal"
+# Erros inesperados não exibem traceback nem caminhos do servidor na tela.
+showErrorDetails = "none"
+
+[server]
+# Mesmo limite de security.TAMANHO_MAXIMO_BYTES (15 MB): arquivos maiores são recusados no upload.
+maxUploadSize = 15
+enableXsrfProtection = true
+
+[browser]
+# Não envia estatísticas de uso do Streamlit para fora.
+gatherUsageStats = false
+
+[theme]
+# Tema claro fixo: mais legível sob sol no canteiro e consistente com os cards executivos.
+base = "light"
+primaryColor = "#1d4ed8"

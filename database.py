@@ -19,7 +19,7 @@ STATUS_OBRA = ("Em Andamento", "Pausada", "Concluída")
 NIVEIS_PRODUTIVIDADE = ("Baixa", "Média", "Alta")
 
 # Entradas que obrigatoriamente precisam estar no .gitignore (dados sensíveis).
-GITIGNORE_OBRIGATORIO = ("*.db", ".env", "uploads/")
+GITIGNORE_OBRIGATORIO = ("*.db", "*.db-wal", "*.db-shm", ".env", "uploads/")
 
 
 # --------------------------------------------------------------------------- #
@@ -86,10 +86,15 @@ def verificar_gitignore() -> list[str]:
 
 @contextmanager
 def get_connection(db_path: Path = DB_PATH) -> Iterator[sqlite3.Connection]:
-    """Abre uma conexão com FK habilitada, commit automático e fechamento garantido."""
-    conn = sqlite3.connect(str(validar_caminho_local(db_path)))
+    """Abre uma conexão com FK e WAL habilitados, commit automático e fechamento garantido.
+
+    WAL (write-ahead log) mantém o banco íntegro se o processo cair no meio de uma
+    gravação e permite leituras enquanto outra sessão grava.
+    """
+    conn = sqlite3.connect(str(validar_caminho_local(db_path)), timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA journal_mode = WAL;")
     try:
         yield conn
         conn.commit()
@@ -249,6 +254,24 @@ def listar_obras() -> list[dict]:
             "SELECT * FROM clientes_obras ORDER BY data_inicio DESC, id DESC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def resumo_obras() -> dict[int, dict]:
+    """Indicadores de todas as obras numa só consulta (para os cards dos blocos).
+
+    Retorna {obra_id: {"tarefas": n, "concluidas": n, "registros": n}}.
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT o.id,
+                   (SELECT COUNT(*) FROM tarefas_obra t WHERE t.obra_id = o.id) AS tarefas,
+                   (SELECT COALESCE(SUM(t.concluida), 0) FROM tarefas_obra t WHERE t.obra_id = o.id) AS concluidas,
+                   (SELECT COUNT(*) FROM registros_diarios r WHERE r.obra_id = o.id) AS registros
+            FROM clientes_obras o
+            """
+        ).fetchall()
+    return {r["id"]: {"tarefas": r["tarefas"], "concluidas": r["concluidas"], "registros": r["registros"]} for r in rows}
 
 
 def criar_obra(

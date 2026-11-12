@@ -13,6 +13,8 @@ env/
 
 # Databases
 *.db
+*.db-wal
+*.db-shm
 *.sqlite3
 
 # Uploads (fotos e áudios das obras)

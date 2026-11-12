@@ -1,4 +1,8 @@
-"""Motor de IA multimodal do ObraTrack AI (Gemini 2.5 Flash) com Modo Demonstração offline."""
+"""Motor de IA multimodal do ObraTrack AI (Gemini 3.8 Flash) com Modo Demonstração offline.
+
+Segurança: a GEMINI_API_KEY é lida EXCLUSIVAMENTE do ambiente do servidor (variável de
+ambiente ou arquivo .env). Ela nunca é recebida pela interface nem exposta ao usuário.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +21,7 @@ from pydantic import BaseModel, Field, PrivateAttr
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 
-MODELO = "gemini-2.5-flash"
+MODELO = "gemini-3.8-flash"
 PLACEHOLDER_CHAVE = "sua_chave_aqui"
 SEM_ATRASO = "Sem atrasos registrados"
 
@@ -85,24 +89,20 @@ class AnaliseDiarioObra(BaseModel):
 # --------------------------------------------------------------------------- #
 # Chave de API
 # --------------------------------------------------------------------------- #
-def obter_api_key(api_key: Optional[str] = None) -> str:
-    """Retorna a chave informada ou a do .env (relida a cada chamada), sem espaços."""
-    if api_key and api_key.strip():
-        chave = api_key.strip()
-    else:
-        load_dotenv(ENV_PATH, override=True)
-        chave = (os.getenv("GEMINI_API_KEY") or "").strip()
+def _obter_api_key() -> str:
+    """Lê a chave estritamente do ambiente do servidor.
+
+    Variáveis de ambiente reais têm prioridade; o .env só preenche o que não existe
+    (load_dotenv sem override). Uso interno: a chave nunca sai deste módulo.
+    """
+    load_dotenv(ENV_PATH)
+    chave = (os.environ.get("GEMINI_API_KEY") or "").strip()
     return "" if chave == PLACEHOLDER_CHAVE else chave
 
 
-def salvar_api_key(api_key: str) -> None:
-    """Grava/atualiza GEMINI_API_KEY no .env e na sessão atual."""
-    from dotenv import set_key
-
-    chave = api_key.strip()
-    ENV_PATH.touch(exist_ok=True)
-    set_key(ENV_PATH, "GEMINI_API_KEY", chave)
-    os.environ["GEMINI_API_KEY"] = chave
+def chave_configurada() -> bool:
+    """Indica se o servidor tem uma GEMINI_API_KEY, sem revelar nenhuma parte dela."""
+    return bool(_obter_api_key())
 
 
 def _erro_de_chave(exc: errors.APIError) -> bool:
@@ -237,14 +237,14 @@ def gerar_analise_demo(
             dims = "dimensões indisponíveis"
         asbuilt = (
             f"Foto do dia arquivada como evidência As-Built ({dims}). A identificação automática de "
-            "tubulações, conduítes e fiação requer a análise de IA (configure a GEMINI_API_KEY)."
+            "tubulações, conduítes e fiação requer a análise de IA (GEMINI_API_KEY no servidor)."
         )
     else:
         asbuilt = "Sem foto para mapeamento As-Built"
 
     transcricao = (
         "[Modo Demonstração] Áudio gravado e arquivado no registro; a transcrição automática "
-        "requer a GEMINI_API_KEY. Ouça o relato original no player."
+        "requer a GEMINI_API_KEY no servidor. Ouça o relato original no player."
         if tem_audio
         else ""
     )
@@ -269,7 +269,6 @@ def processar_registro_obra(
     caminho_foto: Optional[str | Path] = None,
     observacoes_texto: str = "",
     contexto_obra: str = "",
-    api_key: Optional[str] = None,
     modo_demo: bool = False,
 ) -> AnaliseDiarioObra:
     """Analisa áudio + foto + observações de um dia de obra e devolve a análise validada.
@@ -293,9 +292,9 @@ def processar_registro_obra(
     if modo_demo:
         return demo("Modo Demonstração ativado nas Configurações da IA.")
 
-    chave = obter_api_key(api_key)
+    chave = _obter_api_key()
     if not chave:
-        return demo("GEMINI_API_KEY não configurada — análise gerada em Modo Demonstração.")
+        return demo("GEMINI_API_KEY não configurada no servidor — análise gerada em Modo Demonstração.")
 
     client = genai.Client(api_key=chave)
     contents: list = []
@@ -322,7 +321,7 @@ def processar_registro_obra(
         )
     except errors.APIError as exc:
         if _erro_de_chave(exc):
-            return demo("A GEMINI_API_KEY foi rejeitada pelo Google — análise gerada em Modo Demonstração.")
+            return demo("A GEMINI_API_KEY do servidor foi rejeitada pelo Google — análise gerada em Modo Demonstração.")
         raise
     finally:
         if arquivo_remoto is not None:

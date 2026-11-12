@@ -3,7 +3,7 @@
 **Diário de obra com IA multimodal para pequenas reformas e construções.**
 O encarregado grava um áudio de 30 segundos e tira uma foto no canteiro. O ObraTrack AI devolve um relatório técnico do dia, uma justificativa formal de atrasos e o registro **As-Built** (por onde passam canos, conduítes e fiação), tudo vinculado ao bloco daquela cliente.
 
-> Projeto de portfólio de **Produto de IA aplicada à Construção Civil**: Python, Streamlit, SQLite e Google Gemini 2.5 Flash (áudio + imagem + saída estruturada).
+> Projeto de portfólio de **Produto de IA aplicada à Construção Civil**: Python, Streamlit, SQLite e Google Gemini 3.8 Flash (áudio + imagem + saída estruturada).
 
 ---
 
@@ -23,7 +23,7 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
 
 1. **Bloco de Cliente/Obra**: cada obra é um "bloco" com cliente, endereço, escopo e status.
 2. **Registrar Dia**: grava o áudio pelo navegador do celular, anexa a foto e escreve uma observação opcional.
-3. **IA multimodal (Gemini 2.5 Flash)**: cruza o relato, a foto e o **contexto da obra** e devolve um JSON validado:
+3. **IA multimodal (Gemini 3.8 Flash)**: cruza o relato, a foto e o **contexto da obra** e devolve um JSON validado:
    - `transcricao_audio`: transcrição fiel do relato;
    - `resumo_executivo`: atividades do dia em linguagem técnica para a cliente;
    - `nivel_produtividade`: Alta, Média ou Baixa (entregas versus imprevistos);
@@ -45,7 +45,7 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
    ▼
  app.py ──────────── salva mídia em uploads\obra_<id>\<tipo>_<timestamp>_<uuid>.ext
    │
-   ├──► ai_service.py ── google-genai ──► Gemini 2.5 Flash
+   ├──► ai_service.py ── google-genai ──► Gemini 3.8 Flash
    │        • áudio ≤15 MB inline (Part.from_bytes); maior → Files API
    │        • foto via PIL (corrige rotação EXIF)
    │        • prompt com o contexto da obra (escopo, endereço, status)
@@ -67,7 +67,9 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
 - **Contexto da obra no prompt**: a IA avalia a produtividade em relação ao escopo contratado, não no vazio.
 - **Temperatura 0.2**: o registro tem valor quase jurídico; consistência vale mais que criatividade.
 - **`pathlib.Path` em todo o projeto**: caminhos relativos no banco e compatibilidade total com Windows.
-- **Sem arquivos órfãos**: se a IA falhar, a mídia salva naquela tentativa é removida.
+- **Chave de API somente no backend**: a `GEMINI_API_KEY` é lida apenas do ambiente do servidor (variável de ambiente ou `.env`). A interface não recebe nem exibe a chave.
+- **Banco e mídias confinados ao diretório local**: o `obratrack.db` e a pasta `uploads\` são validados para ficarem dentro do projeto, fora de unidades de rede, e só são aceitas mídias de dentro de `uploads\`.
+- **Modo Demonstração**: sem chave válida, o registro é salvo com uma análise por regras locais, sem travar o fluxo.
 
 ## 4. Como rodar (Windows PowerShell)
 

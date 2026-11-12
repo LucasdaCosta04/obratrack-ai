@@ -14,11 +14,11 @@ from PIL import Image, ImageOps
 
 import database as db
 from ai_service import (
+    MODELO,
     SEM_ATRASO,
+    chave_configurada,
     gerar_analise_demo,
-    obter_api_key,
     processar_registro_obra,
-    salvar_api_key,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -48,6 +48,7 @@ def _inicializar_banco() -> bool:
 
 _inicializar_banco()
 st.session_state.setdefault("modo_demo", False)
+CHAVE_OK = chave_configurada()
 
 
 # --------------------------------------------------------------------------- #
@@ -58,12 +59,9 @@ def tem_atraso(motivo: str | None) -> bool:
 
 
 def resolver_caminho(caminho: str | None) -> Path | None:
-    """Caminhos são salvos relativos à raiz do projeto; resolve para absoluto."""
-    if not caminho:
-        return None
-    p = Path(caminho)
-    p = p if p.is_absolute() else BASE_DIR / p
-    return p if p.is_file() else None
+    """Resolve o caminho salvo no banco; só exibe arquivos existentes dentro de uploads\\."""
+    p = db.caminho_midia_seguro(caminho)
+    return p if p and p.is_file() else None
 
 
 def salvar_upload(dados: bytes, prefixo: str, sufixo: str) -> Path:
@@ -253,29 +251,14 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
+    # A chave da API é configurada apenas no servidor; a interface só mostra o status.
     with st.expander("⚙️ Configurações da IA"):
-        chave_atual = obter_api_key()
         if st.session_state["modo_demo"]:
             st.caption("🧪 Modo Demonstração ativo: nenhuma chamada à IA será feita.")
-        elif chave_atual:
-            st.caption(f"✅ Chave configurada (termina em …{chave_atual[-4:]}).")
+        elif CHAVE_OK:
+            st.caption(f"✅ IA conectada ao servidor ({MODELO}).")
         else:
-            st.caption("⚠️ Nenhuma chave configurada. Os registros serão salvos em Modo Demonstração.")
-
-        with st.form("form_api_key", clear_on_submit=True, enter_to_submit=False, border=False):
-            nova_chave = st.text_input(
-                "GEMINI_API_KEY",
-                type="password",
-                placeholder="AIza...",
-                help="Gere a chave em aistudio.google.com/apikey. Ela será salva no arquivo .env do projeto.",
-            )
-            if st.form_submit_button("Salvar chave no .env", width="stretch"):
-                if nova_chave.strip():
-                    salvar_api_key(nova_chave)
-                    st.session_state["flash"] = "Chave da API salva no .env."
-                    st.rerun()
-                else:
-                    st.error("Cole uma chave válida antes de salvar.")
+            st.caption("⚠️ IA indisponível: chave não configurada no servidor.")
 
         st.checkbox(
             "Usar Modo Demonstração (Sem chave de API)",
@@ -283,13 +266,21 @@ with st.sidebar:
             help="Gera a análise por regras locais a partir das observações, sem chamar o Gemini. Ideal para testar a interface.",
         )
 
-    st.caption("ObraTrack AI · Diário de obra com IA multimodal (Gemini 2.5 Flash)")
+    st.caption("ObraTrack AI · Diário de obra com IA multimodal (Gemini 3.8 Flash)")
 
 
 # --------------------------------------------------------------------------- #
 # Tela principal: seleção de Blocos
 # --------------------------------------------------------------------------- #
 st.title("🏗️ ObraTrack AI")
+
+if not CHAVE_OK and not st.session_state["modo_demo"]:
+    st.error(
+        "**IA não configurada no servidor.** Administrador: defina a variável de ambiente "
+        "`GEMINI_API_KEY` (ou crie o arquivo `.env` na raiz do projeto a partir do `.env.example`) "
+        "e reinicie a aplicação. Até lá, os registros são salvos em Modo Demonstração.",
+        icon="🔒",
+    )
 
 if flash := st.session_state.pop("flash", None):
     st.success(flash)

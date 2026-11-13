@@ -39,7 +39,9 @@ CHAVE_OBRA = "obra_selecionada_id"
 MAX_FOTOS_ENVIO = 10  # fotos por envio (registro, tarefa ou galeria)
 DOSSIE_POR_PAGINA = 10  # cards do dossiê exibidos por vez nos resultados da busca
 TIPOS_FOTO = ["jpg", "jpeg", "png"]
-BUFFER_CAMERA = "fotos_camera_buffer"  # {contexto: [{"id", "hash", "dados"}]} fotos batidas, ainda não salvas
+# {contexto: [{"id", "hash", "dados", "kb", "kb_original"}]}: fotos batidas no app de câmera, ainda não salvas.
+BUFFER_CAMERA = "fotos_capturadas_buffer"
+PREFIXO_CAMERA_NATIVA = "camnat_"  # keys dos uploaders que abrem o app de câmera (capture="environment")
 # Ícone do bloco de ambiente (primeira palavra-chave encontrada, sem acentos).
 ICONES_AMBIENTE = [
     (("banheiro", "lavabo", "suite", "wc"), "🚿"),
@@ -186,6 +188,31 @@ _BLOQUEIO_TRADUCAO = """<span class="ot-bloqueio-traducao"></span><script>
 </script>"""
 st.html(_BLOQUEIO_TRADUCAO, unsafe_allow_javascript=True)
 
+# Uploaders de câmera (key "camnat_..."): accept="image/*" + capture="environment" fazem o
+# Android/iOS abrir na hora o app nativo de câmera traseira. Um MutationObserver reaplica os
+# atributos nos uploaders que aparecem depois (reruns, popovers) ou que o React recriar.
+# No computador o atributo é ignorado e abre o seletor de arquivos normal.
+_CAMERA_NATIVA = """<span class="ot-bloqueio-traducao"></span><script>
+(function () {
+  if (window.__otCameraNativa) return;
+  window.__otCameraNativa = true;
+  function aplicar() {
+    document.querySelectorAll('[class*="st-key-%s"] input[type="file"]').forEach(function (inp) {
+      if (inp.getAttribute("capture") !== "environment" || inp.getAttribute("accept") !== "image/*") {
+        inp.setAttribute("accept", "image/*");
+        inp.setAttribute("capture", "environment");
+        inp.removeAttribute("multiple");
+      }
+    });
+  }
+  aplicar();
+  new MutationObserver(aplicar).observe(document.body, {
+    childList: true, subtree: true, attributes: true, attributeFilter: ["accept", "capture", "multiple"]
+  });
+})();
+</script>""" % PREFIXO_CAMERA_NATIVA
+st.html(_CAMERA_NATIVA, unsafe_allow_javascript=True)
+
 
 # --------------------------------------------------------------------------- #
 # Inicialização e acesso
@@ -329,13 +356,18 @@ def midia_corresponde(m: dict, busca: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Câmera: várias fotos seguidas num buffer da sessão, salvas junto com o formulário
+# Câmera nativa do celular: várias fotos seguidas num buffer da sessão
 # --------------------------------------------------------------------------- #
+# O st.camera_input usa o vídeo do navegador (WebRTC, baixa resolução). Aqui um
+# st.file_uploader dedicado recebe accept="image/*" + capture="environment" (script abaixo):
+# no Android/iOS o toque abre direto o APP de câmera traseira, em resolução máxima. A foto
+# volta, é tratada (EXIF/GPS removidos, orientação, LANCZOS 2048 px) e entra no buffer.
 class FotoCapturada:
-    """Foto batida no st.camera_input, com a mesma interface usada do UploadedFile (getvalue)."""
+    """Foto do buffer, com a mesma interface usada do UploadedFile (getvalue)."""
 
-    def __init__(self, dados: bytes) -> None:
+    def __init__(self, dados: bytes, tamanho_original: int | None = None) -> None:
         self._dados = dados
+        self.tamanho_original = tamanho_original or len(dados)
 
     def getvalue(self) -> bytes:
         return self._dados
@@ -345,20 +377,28 @@ def _buffer_camera(contexto: str) -> list[dict]:
     return st.session_state.setdefault(BUFFER_CAMERA, {}).setdefault(contexto, [])
 
 
-def adicionar_foto_buffer(contexto: str, dados: bytes | None) -> bool:
-    """Guarda a foto batida na lista do contexto (sem duplicar e até MAX_FOTOS_ENVIO)."""
-    if not dados:
+def adicionar_foto_buffer(contexto: str, original: bytes | None) -> bool:
+    """Trata a foto da câmera e a guarda na lista do contexto (sem duplicar, até MAX_FOTOS_ENVIO).
+
+    Levanta MidiaInvalidaError (mensagem segura) se o arquivo não for uma foto válida.
+    """
+    if not original:
         return False
     buf = _buffer_camera(contexto)
-    hash_foto = hashlib.sha256(dados).hexdigest()
+    hash_foto = hashlib.sha256(original).hexdigest()
     if any(f["hash"] == hash_foto for f in buf) or len(buf) >= MAX_FOTOS_ENVIO:
         return False
-    buf.append({"id": hash_foto[:12], "hash": hash_foto, "dados": dados})
+    if len(original) > security.TAMANHO_MAXIMO_BYTES:
+        raise MidiaInvalidaError(f"Foto muito grande. O limite é {security.TAMANHO_MAXIMO_BYTES // (1024 * 1024)} MB.")
+    tratada = security.strip_image_exif(original)  # mesma limpeza do validate_and_save_media
+    buf.append({"id": hash_foto[:12], "hash": hash_foto, "dados": tratada,
+                "kb": max(1, len(tratada) // 1024), "kb_original": max(1, len(original) // 1024)})
     return True
 
 
 def fotos_camera(contexto: str) -> list[FotoCapturada]:
-    return [FotoCapturada(f["dados"]) for f in st.session_state.get(BUFFER_CAMERA, {}).get(contexto, [])]
+    return [FotoCapturada(f["dados"], f["kb_original"] * 1024)
+            for f in st.session_state.get(BUFFER_CAMERA, {}).get(contexto, [])]
 
 
 def limpar_buffer_camera(contexto: str) -> None:
@@ -370,39 +410,49 @@ def _remover_foto_buffer(contexto: str, foto_id: str) -> None:
     buf[:] = [f for f in buf if f["id"] != foto_id]
 
 
-def _ao_capturar_foto(contexto: str, chave_cam: str) -> None:
-    """Cada foto batida entra na lista e a câmera volta vazia, pronta para a próxima."""
-    arq = st.session_state.get(chave_cam)
-    if arq is not None and adicionar_foto_buffer(contexto, arq.getvalue()):
-        chave_n = f"cam_n_{contexto}"
-        st.session_state[chave_n] = st.session_state.get(chave_n, 0) + 1
+def _ao_receber_foto_camera(contexto: str, chave_up: str) -> None:
+    """A foto confirmada no app de câmera entra na lista e o botão volta vazio ("Bater outra foto")."""
+    arq = st.session_state.get(chave_up)
+    if arq is None:
+        return
+    try:
+        adicionar_foto_buffer(contexto, arq.getvalue())
+        st.session_state.pop(f"cam_erro_{contexto}", None)
+    except MidiaInvalidaError as exc:
+        st.session_state[f"cam_erro_{contexto}"] = str(exc)
+    chave_n = f"cam_n_{contexto}"
+    st.session_state[chave_n] = st.session_state.get(chave_n, 0) + 1
 
 
 def captura_camera(contexto: str) -> None:
-    """📸 Bater Foto Agora: liga a câmera sob demanda (não pede permissão à toa), bate várias
-    fotos seguidas e mostra as miniaturas com 🗑️ para descartar uma foto tremida.
+    """📸 Abrir Câmera do Celular (Alta Qualidade): abre o app nativo de câmera traseira; cada
+    foto confirmada entra na lista (miniatura + tamanho já tratado), com 🗑️ para descartar.
 
-    Deve ficar FORA de st.form (usa botões). As fotos são salvas pelo formulário do mesmo
-    contexto, junto com as enviadas da galeria, sempre por security.validate_and_save_media.
+    Deve ficar FORA de st.form (usa callback e botões). As fotos são salvas pelo formulário do
+    mesmo contexto, junto com as escolhidas da galeria, sempre por validate_and_save_media.
     """
     buf = _buffer_camera(contexto)
-    # Rótulo fixo: mudar o rótulo recriaria o toggle e desligaria a câmera a cada foto.
-    if st.toggle("📸 Bater Foto Agora (câmera)", key=f"cam_on_{contexto}",
-                 help="Abre a câmera do celular. Cada foto batida entra na lista abaixo; bata quantas precisar "
-                 "e salve no botão do formulário."):
-        if len(buf) < MAX_FOTOS_ENVIO:
-            n = st.session_state.get(f"cam_n_{contexto}", 0)
-            chave_cam = f"cam_{contexto}_{n}"
-            st.camera_input("Enquadre o serviço (com uma referência de medida) e toque para fotografar",
-                            key=chave_cam, on_change=_ao_capturar_foto, args=(contexto, chave_cam))
-        else:
-            st.caption(f"Limite de {MAX_FOTOS_ENVIO} fotos por envio atingido. Salve antes de bater mais.")
+    n = st.session_state.get(f"cam_n_{contexto}", 0)
+    chave_up = f"{PREFIXO_CAMERA_NATIVA}{contexto}_{n}"
+    if len(buf) < MAX_FOTOS_ENVIO:
+        st.file_uploader(
+            "📸 Bater outra foto" if buf else "📸 Abrir Câmera do Celular (Alta Qualidade)",
+            type=TIPOS_FOTO, accept_multiple_files=False, key=chave_up,
+            on_change=_ao_receber_foto_camera, args=(contexto, chave_up),
+            help="No celular, abre direto o aplicativo de câmera traseira, na resolução máxima. Bata a foto, "
+            "confirme e ela entra na lista abaixo; repita quantas vezes precisar e salve no botão do formulário.",
+        )
+    else:
+        st.caption(f"Limite de {MAX_FOTOS_ENVIO} fotos por envio atingido. Salve antes de bater mais.")
+    if erro := st.session_state.get(f"cam_erro_{contexto}"):
+        st.warning(erro, icon="⚠️")
     if buf:
-        st.caption(f"📸 {len(buf)} foto(s) batida(s), serão salvas junto com o formulário:")
+        st.caption(f"📸 {len(buf)} foto(s) da câmera, serão salvas junto com o formulário:")
         grade = st.columns(min(len(buf), 4))
         for i, f in enumerate(buf):
             with grade[i % len(grade)].container(border=True, key=f"cam_thumb_{contexto}_{f['id']}"):
                 st.image(f["dados"], width="stretch")
+                st.caption(f"📦 {f['kb']} KB (original {formatar_bytes(f['kb_original'] * 1024)})")
                 st.button("🗑️ Remover", key=f"cam_rm_{contexto}_{f['id']}", width="stretch",
                           on_click=_remover_foto_buffer, args=(contexto, f["id"]),
                           help="Descartar esta foto (ex.: ficou tremida).")
@@ -433,7 +483,8 @@ def salvar_fotos(
         db.inserir_midia_obra(
             obra_id, caminho, sanitize_text(ambiente, LIM_AMBIENTE) or "Geral",
             sanitize_text(titulo_servico, LIM_TAREFA), sanitize_text(descricao_tecnica, LIMITE_TEXTO_LONGO),
-            registro_id=registro_id, tarefa_id=tarefa_id, data_midia=data_midia, foto_bytes_original=len(dados),
+            registro_id=registro_id, tarefa_id=tarefa_id, data_midia=data_midia,
+            foto_bytes_original=getattr(arq, "tamanho_original", None) or len(dados),
         )
         salvas += 1
     if len(arquivos) > MAX_FOTOS_ENVIO:
@@ -1392,7 +1443,7 @@ with aba_registro:
             "atrasou (chuva, faltas, material) e onde passaram canos/fios.",
         )
         fotos_up = st.file_uploader(
-            "📁 Enviar da Galeria: fotos da reforma / tubulação (pode enviar várias)",
+            "🖼️ Escolher da Galeria do Aparelho: fotos da reforma / tubulação (pode enviar várias)",
             key=f"reg_fotos_{obra_id}",
             type=TIPOS_FOTO,
             accept_multiple_files=True,
@@ -1417,7 +1468,7 @@ with aba_registro:
             help="Dia a que o relato se refere. Altere para lançar um dia anterior.",
         )
         if n_cam := len(fotos_camera(ctx_cam_reg)):
-            st.caption(f"📸 + {n_cam} foto(s) batida(s) na câmera entram neste registro.")
+            st.caption(f"📸 + {n_cam} foto(s) da câmera entram neste registro.")
         enviar = st.form_submit_button("Processar com IA e Salvar no Bloco", type="primary", width="stretch",
                                        key=f"reg_enviar_{obra_id}")
 
@@ -1436,7 +1487,8 @@ with aba_registro:
         for i, arq in enumerate(todas_fotos_reg[:MAX_FOTOS_ENVIO], start=1):
             try:
                 dados_foto = arq.getvalue()
-                fotos_salvas.append((security.validate_and_save_media(dados_foto, "image"), len(dados_foto)))
+                fotos_salvas.append((security.validate_and_save_media(dados_foto, "image"),
+                                     getattr(arq, "tamanho_original", None) or len(dados_foto)))
             except MidiaInvalidaError as exc:
                 erros_midia.append(f"Foto {i} recusada: {exc}")
         if len(todas_fotos_reg) > MAX_FOTOS_ENVIO:
@@ -1685,7 +1737,7 @@ def linha_tarefa(t: dict) -> None:
             ctx_cam_t = f"tarefa_{t['id']}"
             captura_camera(ctx_cam_t)
             with st.form(f"form_fotos_tarefa_{t['id']}", clear_on_submit=True, enter_to_submit=False, border=False):
-                novas = st.file_uploader("📁 Enviar da Galeria", type=TIPOS_FOTO, accept_multiple_files=True,
+                novas = st.file_uploader("🖼️ Escolher da Galeria do Aparelho", type=TIPOS_FOTO, accept_multiple_files=True,
                                          key=f"up_tarefa_{t['id']}", help=f"Até {MAX_FOTOS_ENVIO} por envio.")
                 desc_foto = st.text_input("Descrição técnica (opcional)", max_chars=LIM_TAREFA, key=f"fotos_tarefa_desc_{t['id']}",
                                           placeholder="Ex.: cano de água fria a 30 cm do piso")
@@ -1732,7 +1784,7 @@ with aba_checklist:
             )
             nova_ok = st.checkbox("Já concluída", help="Marque se a tarefa já foi executada.", key=f"nova_tarefa_ok_{obra_id}")
             novas_fotos = st.file_uploader(
-                "📁 Enviar da Galeria: fotos desta tarefa (opcional)", type=TIPOS_FOTO, accept_multiple_files=True,
+                "🖼️ Escolher da Galeria do Aparelho: fotos desta tarefa (opcional)", type=TIPOS_FOTO, accept_multiple_files=True,
                 key=f"up_nova_tarefa_{obra_id}",
                 help="As fotos entram na Galeria da Obra já no ambiente e no serviço desta tarefa.",
             )
@@ -1838,7 +1890,7 @@ def form_adicionar_fotos(chave: str, ambiente_fixo: str | None = None) -> None:
                                help="Vira o subtítulo das fotos na galeria. Em branco: usa o texto da tarefa.")
         descricao = st.text_area("Descrição técnica (opcional)", max_chars=LIMITE_TEXTO_LONGO, key=f"{chave}_desc",
                                  placeholder="Ex.: tubo de água quente a 30 cm do piso, lado esquerdo")
-        arquivos = st.file_uploader("📁 Enviar da Galeria", type=TIPOS_FOTO, accept_multiple_files=True, key=f"{chave}_up",
+        arquivos = st.file_uploader("🖼️ Escolher da Galeria do Aparelho", type=TIPOS_FOTO, accept_multiple_files=True, key=f"{chave}_up",
                                     help=f"Até {MAX_FOTOS_ENVIO} por envio. A localização e os dados do celular são removidos.")
         if st.form_submit_button("📎 Adicionar fotos", type="primary", width="stretch", key=f"{chave}_enviar"):
             tarefa = next((t for t in tarefas if t["id"] == tarefa_id), None)

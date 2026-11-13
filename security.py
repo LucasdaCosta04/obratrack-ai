@@ -28,10 +28,10 @@ BASE_DIR = Path(__file__).resolve().parent
 UPLOADS_DIR = BASE_DIR / "uploads"
 
 TAMANHO_MAXIMO_BYTES = 15 * 1024 * 1024  # 15 MB por arquivo
-# Fotos: lado máximo de 1600 px e JPEG qualidade 78. Ainda dá para ler bitola de cano e
-# trajeto de conduíte, e uma foto de 5-10 MB do celular cai para ~120-200 KB.
-LADO_MAXIMO_FOTO = 1600
-QUALIDADE_JPEG = 78
+# Fotos: lado máximo de 2048 px (LANCZOS) e JPEG qualidade 85. Preserva a nitidez da câmera
+# nativa do celular (fios, conexões, rachaduras) e uma foto de 4-12 MB cai para ~200-350 KB.
+LADO_MAXIMO_FOTO = 2048
+QUALIDADE_JPEG = 85
 
 LIMITE_TEXTO_PADRAO = 2_000
 LIMITE_TEXTO_LONGO = 20_000  # transcrições e textos gerados pela IA
@@ -67,19 +67,40 @@ def imagem_sem_metadados(img: Image.Image) -> Image.Image:
     return Image.frombytes("RGB", img.size, img.tobytes())
 
 
-def strip_image_exif(image_bytes: bytes, lado_maximo: int = LADO_MAXIMO_FOTO) -> bytes:
-    """Regrava a imagem como JPEG limpo e compacto.
+def _jpeg_ja_limpo(img: Image.Image, image_bytes: bytes, lado_maximo: int) -> bool:
+    """True se a imagem já é um JPEG RGB gerado por esta função: só o segmento APP0/JFIF,
+    nenhum EXIF/XMP/ICC/IPTC/comentário, nada depois do fim da imagem e dentro do tamanho.
 
-    Remove 100% dos metadados (GPS, data/hora, aparelho), reduz proporcionalmente para
-    caber em `lado_maximo` x `lado_maximo` (nunca amplia) e comprime (qualidade 78, optimize).
+    Evita recomprimir (e perder nitidez) a foto que já foi tratada ao entrar no buffer da câmera.
+    """
+    if img.format != "JPEG" or img.mode != "RGB" or max(img.size) > lado_maximo:
+        return False
+    if not image_bytes.endswith(b"\xff\xd9"):
+        return False  # dados anexados após o fim da imagem (ex.: trailer de metadados do aparelho)
+    if any(k in img.info for k in ("exif", "xmp", "icc_profile", "photoshop", "comment", "adobe")):
+        return False
+    return all(marca == "APP0" and dados.startswith(b"JFIF\x00") for marca, dados in getattr(img, "applist", []))
+
+
+def strip_image_exif(image_bytes: bytes, lado_maximo: int = LADO_MAXIMO_FOTO) -> bytes:
+    """Regrava a imagem como JPEG limpo e nítido.
+
+    1) `ImageOps.exif_transpose`: aplica a orientação do celular (retrato/paisagem) aos pixels,
+       para a foto não ficar deitada ou de cabeça para baixo depois de perder o EXIF;
+    2) remove 100% dos metadados (GPS, data/hora, aparelho);
+    3) reduz com `Image.Resampling.LANCZOS` para caber em 2048 x 2048 (nunca amplia);
+    4) salva em JPEG qualidade 85, optimize.
+    Uma imagem que já saiu desta função é devolvida sem recompressão.
     """
     try:
         with warnings.catch_warnings():
             # Imagem gigante (possível "decompression bomb") vira erro em vez de aviso.
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(image_bytes)) as original:
-                original.load()
-                limpa = imagem_sem_metadados(original)
+                original.load()  # decodifica tudo: arquivo corrompido falha aqui
+                if _jpeg_ja_limpo(original, image_bytes, lado_maximo):
+                    return image_bytes
+                limpa = imagem_sem_metadados(original)  # exif_transpose + só os pixels
                 limpa.thumbnail((lado_maximo, lado_maximo), Image.Resampling.LANCZOS)
     except MidiaInvalidaError:
         raise
@@ -119,7 +140,7 @@ def validate_and_save_media(file_bytes: bytes, media_type: str) -> Path:
 
     `media_type` é "audio" (WAV, MP3 ou OGG) ou "image" (JPEG ou PNG). O tipo é decidido
     pelo conteúdo real do arquivo, nunca pelo nome ou extensão enviados. Fotos são salvas
-    sempre como JPEG sem metadados, com no máximo 1600 px de lado. Retorna o caminho relativo à pasta do projeto,
+    sempre como JPEG sem metadados, orientação corrigida e no máximo 2048 px de lado (LANCZOS, q85). Retorna o caminho relativo à pasta do projeto,
     no formato gravado no banco (ex.: uploads\\3f2a...e1.jpg).
     """
     if media_type not in ("audio", "image"):

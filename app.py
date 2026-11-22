@@ -6,6 +6,7 @@ import base64
 import hashlib
 import io
 import logging
+import os
 import re
 import unicodedata
 import zipfile
@@ -313,7 +314,8 @@ def indicadores(registros: list[dict], tarefas: list[dict], midias: list[dict] |
         "dias_trabalhados": len({r["data_registro"] for r in registros}),
         "alertas_atraso": len({r["data_registro"] for r in registros if tem_atraso(r["motivo_atraso"])}),
         "registros": len(registros),
-        "fotos": len(midias_com_arquivo(midias or [])),
+        # Arquivos únicos: a mesma foto vinculada a várias tarefas conta uma vez.
+        "fotos": len({_chave_arquivo(p) for _, p in midias_com_arquivo(midias or [])}),
     }
 
 
@@ -653,8 +655,14 @@ def imagem_base64(caminho: Path, lado_max: int = 900) -> str | None:
         return None
 
 
-def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict], midias: list[dict]) -> str:
-    """Relatório autocontido (fotos embutidas, sem metadados) para enviar ou imprimir em PDF."""
+def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict], midias: list[dict],
+                         fotos_relativas: dict[int, str] | None = None) -> str:
+    """Relatório autocontido (fotos embutidas, sem metadados) para enviar ou imprimir em PDF.
+
+    Com `fotos_relativas` ({midia_id: caminho relativo}), usado dentro do ZIP, as imagens apontam
+    para os arquivos das pastas em vez de base64: uma foto compartilhada por várias tarefas aparece
+    em cada uma delas, mas existe uma única vez no ZIP.
+    """
     k = indicadores(registros, tarefas, midias)
     cronologicos = sorted(registros, key=lambda r: (r["data_registro"], r["id"]))
 
@@ -679,12 +687,22 @@ def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict],
     for ambiente, servicos in agrupar_midias(midias_com_arquivo(midias)).items():
         figuras = []
         for (servico, data_m), itens in servicos.items():
+            vistas: set[str] = set()  # a mesma foto não se repete dentro do mesmo serviço/dia
             for m, foto in itens:
-                if not (b64 := imagem_base64(foto)):
+                if (chave := _chave_arquivo(foto)) in vistas:
+                    continue
+                vistas.add(chave)
+                if fotos_relativas is not None:
+                    if not (rel := fotos_relativas.get(m["id"])):
+                        continue
+                    src = esc(rel)
+                elif b64 := imagem_base64(foto):
+                    src = f"data:image/jpeg;base64,{b64}"
+                else:
                     continue
                 detalhe = f"<br>{esc(m['descricao_tecnica'])}" if m.get("descricao_tecnica") else ""
                 figuras.append(
-                    f"<figure><img src='data:image/jpeg;base64,{b64}' alt='Foto técnica'>"
+                    f"<figure><img src='{src}' alt='Foto técnica' loading='lazy'>"
                     f"<figcaption><strong>{esc(servico, LIM_TAREFA)}</strong> — {esc(formatar_data(data_m))}"
                     f"{detalhe}</figcaption></figure>"
                 )
@@ -789,6 +807,16 @@ def _caminho_zip(*partes: str) -> str:
     return "/".join(partes)
 
 
+def _chave_arquivo(foto: Path) -> str:
+    """Identidade do arquivo físico (Windows: sem diferenciar maiúsculas nem / e \\)."""
+    return os.path.normcase(str(foto.resolve()))
+
+
+def _unicos(valores) -> list:
+    """Valores não vazios, sem repetição, na ordem em que aparecem."""
+    return list(dict.fromkeys(v.strip() for v in valores if v and str(v).strip()))
+
+
 def _pasta_comodo(ambiente: str | None) -> str:
     """Slug do cômodo; fotos sem cômodo (vazio/'Geral', inclusive registros antigos) vão para 'geral'."""
     if db.normalizar_busca(ambiente or "").strip() in ("", "geral"):
@@ -818,12 +846,17 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
     """
     s = sanitize_text
     raiz = slug_obra(obra)
-    # {pasta: [(midia, arquivo)]}; cômodos que só diferem em acento/maiúscula caem na mesma pasta.
-    pastas: dict[str, list[tuple[dict, Path]]] = {}
+    # Deduplicação: {(pasta, arquivo físico): [linhas do banco]}. A mesma foto vinculada a várias
+    # tarefas do mesmo cômodo vira UMA entrada no ZIP; em cômodos diferentes, uma por pasta.
+    # Cômodos que só diferem em acento/maiúscula caem na mesma pasta.
+    grupos: dict[tuple[str, str], list[tuple[dict, Path]]] = {}
     for m, foto in sorted(midias_com_arquivo(midias), key=lambda x: (x[0].get("data_midia") or "", x[0]["id"])):
-        pastas.setdefault(_pasta_comodo(m.get("ambiente")), []).append((m, foto))
+        grupos.setdefault((_pasta_comodo(m.get("ambiente")), _chave_arquivo(foto)), []).append((m, foto))
+    pastas: dict[str, list[list[tuple[dict, Path]]]] = {}
+    for (pasta, _), linhas in grupos.items():
+        pastas.setdefault(pasta, []).append(linhas)
     pastas = dict(sorted(pastas.items()))
-    total_fotos = sum(len(v) for v in pastas.values())
+    total_fotos = len(grupos)
 
     sep = "=" * 72
     memorial = [
@@ -844,21 +877,33 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
         sep,
     ]
     buf = io.BytesIO()
-    usados: set[str] = set()
+    usados: set[str] = set()  # nomes já gravados no ZIP
+    gravadas: dict[tuple[str, str], str] = {}  # (pasta, arquivo físico) -> nome no ZIP
+    fotos_por_tarefa: dict[int, list[str]] = {}  # tarefa_id -> nomes no ZIP (checklist do memorial)
+    src_por_midia: dict[int, str] = {}  # midia_id -> caminho relativo (imagens do relatório HTML)
     with zipfile.ZipFile(buf, "w") as zf:
-        for pasta, itens in pastas.items():
+        for pasta, fotos in pastas.items():
             if pasta == PASTA_GERAL:
                 nome_comodo = "GERAL (sem cômodo específico)"
             else:
-                nome_comodo = s(itens[0][0]["ambiente"], LIM_AMBIENTE).upper()
+                nome_comodo = s(fotos[0][0][0]["ambiente"], LIM_AMBIENTE).upper()
             memorial += [f"CÔMODO: {nome_comodo}  (pasta {raiz}/{pasta}/)", "-" * 72]
             sequencias: dict[tuple[str, str], int] = {}  # sequência por data + tarefa dentro do cômodo
-            for m, foto in itens:
-                servico = m.get("titulo_servico") or "Registro fotográfico"
-                data_slug = security.sanitize_slug(m.get("data_midia"), padrao="sem-data")
-                tarefa_slug = security.sanitize_slug(
-                    m.get("tarefa_descricao") or servico, padrao="registro-fotografico", max_length=50
+            for linhas in fotos:
+                m, foto = linhas[0]  # primeira ocorrência (mais antiga) define data e arquivo
+                chave = (pasta, _chave_arquivo(foto))
+                if chave in gravadas:  # já está nesta pasta: não grava de novo
+                    continue
+                servicos = _unicos(ln.get("titulo_servico") or "Registro fotográfico" for ln, _ in linhas)
+                tarefas_foto = {ln["tarefa_id"]: ln for ln, _ in linhas if ln.get("tarefa_id") and ln.get("tarefa_descricao")}
+                slugs = _unicos(
+                    security.sanitize_slug(ln.get("tarefa_descricao") or ln.get("titulo_servico"),
+                                           padrao="registro-fotografico", max_length=50)
+                    for ln, _ in linhas
                 )
+                # Uma tarefa: nome dela. Várias tarefas na mesma foto: nome neutro, sem favorecer nenhuma.
+                tarefa_slug = slugs[0] if len(slugs) == 1 else "multiplas-tarefas"
+                data_slug = security.sanitize_slug(m.get("data_midia"), padrao="sem-data")
                 dados, ext = _bytes_foto_para_zip(foto)
                 seq = sequencias.get((data_slug, tarefa_slug), 0)
                 while True:  # nunca sobrescreve uma entrada já gravada no ZIP
@@ -868,18 +913,26 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
                         break
                 sequencias[(data_slug, tarefa_slug)] = seq
                 usados.add(nome)
+                gravadas[chave] = nome
                 zf.writestr(nome, dados, compress_type=zipfile.ZIP_STORED)
+                relativo = nome.removeprefix(f"{raiz}/")
+                for ln, _ in linhas:
+                    src_por_midia[ln["id"]] = relativo
+                for tid in tarefas_foto:
+                    fotos_por_tarefa.setdefault(tid, []).append(nome)
+
                 memorial += [
                     f"- {nome}",
                     f"     Data       : {formatar_data(m.get('data_midia'))}",
-                    f"     Serviço    : {s(servico, LIM_TAREFA)}",
-                    f"     As-Built   : {s(m.get('descricao_tecnica') or '-')}",
+                    f"     Serviço    : {' | '.join(s(sv, LIM_TAREFA) for sv in servicos)}",
                 ]
-                if m.get("tarefa_descricao"):
-                    status = "concluída" if m.get("tarefa_concluida") else "pendente"
-                    memorial.append(f"     Tarefa     : {s(m['tarefa_descricao'], LIM_TAREFA)} ({status})")
-                if tem_atraso(m.get("motivo_atraso")):
-                    memorial.append(f"     Atraso     : {s(m['motivo_atraso'])}")
+                for desc in _unicos(ln.get("descricao_tecnica") for ln, _ in linhas) or ["-"]:
+                    memorial.append(f"     As-Built   : {s(desc)}")
+                for t in tarefas_foto.values():
+                    status = "concluída" if t.get("tarefa_concluida") else "pendente"
+                    memorial.append(f"     Tarefa     : {s(t['tarefa_descricao'], LIM_TAREFA)} ({status})")
+                for atraso in _unicos(ln.get("motivo_atraso") for ln, _ in linhas if tem_atraso(ln.get("motivo_atraso"))):
+                    memorial.append(f"     Atraso     : {s(atraso)}")
                 memorial.append("")
         if not pastas:
             memorial += ["Nenhuma foto técnica registrada.", ""]
@@ -898,7 +951,10 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
         for ambiente, itens in agrupar_por_ambiente(tarefas).items():
             feitas = sum(t["concluida"] for t in itens)
             memorial.append(f"{s(ambiente, LIM_AMBIENTE)} ({feitas}/{len(itens)})")
-            memorial += [f"  [{'x' if t['concluida'] else ' '}] {s(t['descricao'], LIM_TAREFA)}" for t in itens]
+            for t in itens:
+                memorial.append(f"  [{'x' if t['concluida'] else ' '}] {s(t['descricao'], LIM_TAREFA)}")
+                # Toda tarefa referencia suas fotos, mesmo quando a foto é compartilhada com outra tarefa.
+                memorial += [f"        foto: {nome}" for nome in fotos_por_tarefa.get(t["id"], [])]
         if not tarefas:
             memorial.append("Nenhuma tarefa registrada.")
         memorial += ["", "Gerado pelo ObraTrack AI."]
@@ -911,7 +967,8 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
         )
         zf.writestr(
             _caminho_zip(raiz, "relatorio_obra.html"),
-            gerar_relatorio_html(obra, registros, tarefas, midias).encode("utf-8"),
+            # Dentro do ZIP o relatório aponta para os .jpg das pastas (sem embutir cópias em base64).
+            gerar_relatorio_html(obra, registros, tarefas, midias, fotos_relativas=src_por_midia).encode("utf-8"),
             compress_type=zipfile.ZIP_DEFLATED,
         )
     return buf.getvalue()

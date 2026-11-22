@@ -757,29 +757,72 @@ def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict],
 </body></html>"""
 
 
-def _bytes_foto_para_zip(foto: Path) -> bytes:
-    """Bytes da foto para o ZIP. Fotos antigas que ainda tenham metadados são limpas antes."""
+PASTA_GERAL = "geral"  # fotos sem cômodo específico (ambiente vazio ou "Geral")
+
+
+def _bytes_foto_para_zip(foto: Path) -> tuple[bytes, str]:
+    """(bytes, extensão) da foto para o ZIP, sempre que possível em JPEG limpo.
+
+    Fotos novas já são JPEG sem metadados e saem intactas. Fotos legadas (PNG ou JPEG com
+    EXIF/GPS) são regravadas como JPEG limpo. Se a imagem não puder ser lida, vai o arquivo
+    original com a extensão dele, para nenhuma foto sumir da exportação.
+    """
     dados = foto.read_bytes()
     try:
         with Image.open(io.BytesIO(dados)) as img:
+            eh_jpeg = img.format == "JPEG"
             tem_metadados = bool(img.getexif()) or any(k in img.info for k in ("exif", "xmp", "icc_profile"))
+        if eh_jpeg and not tem_metadados:
+            return dados, ".jpg"
+        return security.strip_image_exif(dados), ".jpg"
     except Exception:
-        return dados
-    return security.strip_image_exif(dados) if tem_metadados else dados
+        sufixo = foto.suffix.lower()
+        return dados, sufixo if sufixo in (".jpg", ".jpeg", ".png") else ".jpg"
+
+
+def _caminho_zip(*partes: str) -> str:
+    """Junta segmentos já saneados; recusa o que não for slug (defesa extra contra path traversal)."""
+    for p in partes:
+        base, _, ext = p.partition(".")
+        if not security.SLUG_VALIDO.fullmatch(base) or ext not in ("", "jpg", "jpeg", "png", "txt", "html"):
+            raise ValueError(f"Segmento de caminho inseguro no ZIP: {p!r}")
+    return "/".join(partes)
+
+
+def _pasta_comodo(ambiente: str | None) -> str:
+    """Slug do cômodo; fotos sem cômodo (vazio/'Geral', inclusive registros antigos) vão para 'geral'."""
+    if db.normalizar_busca(ambiente or "").strip() in ("", "geral"):
+        return PASTA_GERAL
+    return security.sanitize_slug(ambiente, padrao=PASTA_GERAL)
+
+
+def slug_obra(obra: dict) -> str:
+    return security.sanitize_slug(obra.get("nome_cliente"), padrao=f"obra-{obra.get('id') or 'sem-id'}")
+
+
+def nome_arquivo_zip(obra: dict) -> str:
+    return f"{slug_obra(obra)}_{date.today():%Y%m%d}.zip"
 
 
 def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], midias: list[dict]) -> bytes:
-    """ZIP em memória com as fotos em subpastas por ambiente e o memorial descritivo.
+    """ZIP em memória com as fotos organizadas por obra e cômodo, e o relatório na raiz.
 
-    Ex.: Banheiro_Social/01_2026-11-11_retirada_da_ceramica.jpg, Cozinha/01_...jpg.
-    Os nomes organizados existem só dentro do ZIP; no servidor as fotos seguem com nome UUID.
+        {slug-da-obra}/relatorio_obra.html               relatório completo (abre no navegador)
+        {slug-da-obra}/memorial_descritivo_asbuilt.txt   resumo + índice das fotos
+        {slug-da-obra}/{slug-do-comodo}/{data}_{slug-da-tarefa}_{seq}.jpg
+        {slug-da-obra}/geral/...                         fotos sem cômodo específico
+
+    Ex.: reforma-joao-silva/banheiro-social/2026-11-11_retirada-da-ceramica_01.jpg
+    Os nomes organizados existem só dentro do ZIP; no servidor e no banco as fotos seguem com
+    nome UUID, então nenhum registro existente é alterado.
     """
     s = sanitize_text
-    # Pastas por ambiente (ambientes que só diferem em acento/maiúscula caem na mesma pasta).
+    raiz = slug_obra(obra)
+    # {pasta: [(midia, arquivo)]}; cômodos que só diferem em acento/maiúscula caem na mesma pasta.
     pastas: dict[str, list[tuple[dict, Path]]] = {}
-    for m, foto in sorted(midias_com_arquivo(midias), key=lambda x: (x[0]["data_midia"], x[0]["id"])):
-        pastas.setdefault(slug(m["ambiente"], "_"), []).append((m, foto))
-    pastas = dict(sorted(pastas.items(), key=lambda kv: kv[0].casefold()))
+    for m, foto in sorted(midias_com_arquivo(midias), key=lambda x: (x[0].get("data_midia") or "", x[0]["id"])):
+        pastas.setdefault(_pasta_comodo(m.get("ambiente")), []).append((m, foto))
+    pastas = dict(sorted(pastas.items()))
     total_fotos = sum(len(v) for v in pastas.values())
 
     sep = "=" * 72
@@ -791,25 +834,44 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
         f"Escopo       : {s(obra.get('escopo_resumo') or 'não informado', LIM_ESCOPO)}",
         f"Status       : {obra['status']} · Início em {formatar_data(obra['data_inicio'])}",
         f"Emitido em   : {datetime.now():%d/%m/%Y %H:%M}",
-        f"Fotos        : {total_fotos} em {len(pastas)} pasta(s) de ambiente",
+        f"Fotos        : {total_fotos} em {len(pastas)} pasta(s) de cômodo",
+        "Relatório    : relatorio_obra.html (abra no navegador; dá para imprimir em PDF)",
         "",
         "Cada foto registra a posição real de tubulações, conduítes e fiação antes do",
         "fechamento (reboco/revestimento). Consulte antes de furar paredes ou pisos.",
         "",
-        "1. FOTOS POR AMBIENTE E SERVIÇO",
+        "1. FOTOS POR CÔMODO E SERVIÇO",
         sep,
     ]
     buf = io.BytesIO()
+    usados: set[str] = set()
     with zipfile.ZipFile(buf, "w") as zf:
         for pasta, itens in pastas.items():
-            memorial += [f"AMBIENTE: {s(itens[0][0]['ambiente'], LIM_AMBIENTE).upper()}  (pasta {pasta}/)", "-" * 72]
-            for i, (m, foto) in enumerate(itens, start=1):
+            if pasta == PASTA_GERAL:
+                nome_comodo = "GERAL (sem cômodo específico)"
+            else:
+                nome_comodo = s(itens[0][0]["ambiente"], LIM_AMBIENTE).upper()
+            memorial += [f"CÔMODO: {nome_comodo}  (pasta {raiz}/{pasta}/)", "-" * 72]
+            sequencias: dict[tuple[str, str], int] = {}  # sequência por data + tarefa dentro do cômodo
+            for m, foto in itens:
                 servico = m.get("titulo_servico") or "Registro fotográfico"
-                nome = f"{pasta}/{i:02d}_{m['data_midia']}_{slug(servico, '_', 'foto').lower()}{foto.suffix.lower()}"
-                zf.writestr(nome, _bytes_foto_para_zip(foto), compress_type=zipfile.ZIP_STORED)
+                data_slug = security.sanitize_slug(m.get("data_midia"), padrao="sem-data")
+                tarefa_slug = security.sanitize_slug(
+                    m.get("tarefa_descricao") or servico, padrao="registro-fotografico", max_length=50
+                )
+                dados, ext = _bytes_foto_para_zip(foto)
+                seq = sequencias.get((data_slug, tarefa_slug), 0)
+                while True:  # nunca sobrescreve uma entrada já gravada no ZIP
+                    seq += 1
+                    nome = _caminho_zip(raiz, pasta, f"{data_slug}_{tarefa_slug}_{seq:02d}{ext}")
+                    if nome not in usados:
+                        break
+                sequencias[(data_slug, tarefa_slug)] = seq
+                usados.add(nome)
+                zf.writestr(nome, dados, compress_type=zipfile.ZIP_STORED)
                 memorial += [
-                    f"[{i:02d}] {nome}",
-                    f"     Data       : {formatar_data(m['data_midia'])}",
+                    f"- {nome}",
+                    f"     Data       : {formatar_data(m.get('data_midia'))}",
                     f"     Serviço    : {s(servico, LIM_TAREFA)}",
                     f"     As-Built   : {s(m.get('descricao_tecnica') or '-')}",
                 ]
@@ -832,7 +894,7 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
         if not registros:
             memorial.append("Nenhum registro.")
 
-        memorial += ["", "3. CHECKLIST POR AMBIENTE", sep]
+        memorial += ["", "3. CHECKLIST POR CÔMODO", sep]
         for ambiente, itens in agrupar_por_ambiente(tarefas).items():
             feitas = sum(t["concluida"] for t in itens)
             memorial.append(f"{s(ambiente, LIM_AMBIENTE)} ({feitas}/{len(itens)})")
@@ -843,8 +905,13 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
 
         # utf-8-sig + CRLF: acentos e quebras de linha corretos no Bloco de Notas do Windows.
         zf.writestr(
-            "Memorial_Descritivo_AsBuilt.txt",
+            _caminho_zip(raiz, "memorial_descritivo_asbuilt.txt"),
             "\r\n".join(memorial).encode("utf-8-sig"),
+            compress_type=zipfile.ZIP_DEFLATED,
+        )
+        zf.writestr(
+            _caminho_zip(raiz, "relatorio_obra.html"),
+            gerar_relatorio_html(obra, registros, tarefas, midias).encode("utf-8"),
             compress_type=zipfile.ZIP_DEFLATED,
         )
     return buf.getvalue()
@@ -1924,13 +1991,14 @@ with aba_galeria:
             key=f"dl_zip_{obra_id}",
             # Gerado só no clique: subpastas por ambiente + memorial descritivo.
             data=partial(gerar_zip_asbuilt, obra, registros, tarefas, midias_obra),
-            file_name=f"fotos_obra_{obra_id}_{date.today():%Y%m%d}.zip",
+            file_name=nome_arquivo_zip(obra),
             mime="application/zip",
             width="stretch",
             type="primary",
             on_click="ignore",
-            help="Todas as fotos em pastas por cômodo (Banheiro_Social/01_2026-11-11_retirada_da_ceramica.jpg, "
-            "Cozinha/...) e o Memorial_Descritivo_AsBuilt.txt com a descrição técnica de cada foto.",
+            help="Pasta da obra com as fotos separadas por cômodo "
+            "(banheiro-social/2026-11-11_retirada-da-ceramica_01.jpg; fotos sem cômodo em geral/), "
+            "mais o relatorio_obra.html e o memorial_descritivo_asbuilt.txt na raiz.",
         )
     with st.expander("➕ Adicionar fotos na galeria", expanded=not todas_fotos, key=f"exp_galeria_nova_{obra_id}"):
         form_adicionar_fotos(f"form_galeria_nova_{obra_id}")

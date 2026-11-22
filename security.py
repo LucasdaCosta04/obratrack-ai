@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import uuid
 import warnings
 from pathlib import Path
@@ -184,6 +185,37 @@ def sanitize_text(text: object, max_length: int = LIMITE_TEXTO_PADRAO, escape_ht
     if len(texto) > max_length:
         texto = texto[:max_length].rstrip()
     return html.escape(texto, quote=True) if escape_html else texto
+
+
+# Nomes de dispositivo reservados do Windows: não podem ser nome de pasta/arquivo.
+_NOMES_RESERVADOS_WINDOWS = frozenset(
+    {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+)
+SLUG_VALIDO = re.compile(r"[a-z0-9]+(?:[-_][a-z0-9]+)*")
+
+
+def sanitize_slug(texto: object, padrao: str = "geral", max_length: int = 60, sep: str = "-") -> str:
+    """Converte qualquer texto em um único segmento seguro de caminho (pasta ou arquivo).
+
+    'Banheiro Social (Suíte)' -> 'banheiro-social-suite'; 'Ação/Reforma' -> 'acao-reforma'.
+    - remove acentos (NFKD) e caracteres de controle, e passa para minúsculas;
+    - qualquer sequência fora de [a-z0-9] vira um único `sep` (espaços, pontuação, emoji);
+    - path traversal é impossível: '.', '/', '\' e ':' nunca sobrevivem, então '../../etc'
+      vira 'etc' e '..' vira `padrao`;
+    - evita nomes reservados do Windows (CON, NUL, COM1...) e limita o tamanho.
+    O resultado sempre casa com SLUG_VALIDO; texto vazio devolve `padrao` (também saneado).
+    """
+    if sep not in ("-", "_"):
+        raise ValueError(f"sep inválido: {sep!r}")
+    bruto = _CONTROLE.sub("", str(texto or ""))
+    sem_acento = "".join(c for c in unicodedata.normalize("NFKD", bruto) if not unicodedata.combining(c))
+    slug = re.sub(r"[^a-z0-9]+", sep, sem_acento.casefold()).strip(sep)
+    slug = slug[: max(1, max_length)].strip(sep)
+    if slug in _NOMES_RESERVADOS_WINDOWS:
+        slug = f"{slug}{sep}x"
+    if not slug:
+        return sanitize_slug(padrao, padrao="item", max_length=max_length, sep=sep) if padrao != "item" else "item"
+    return slug
 
 
 # --------------------------------------------------------------------------- #

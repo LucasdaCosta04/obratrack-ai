@@ -7,6 +7,25 @@ O encarregado grava um áudio de 30 segundos e tira uma foto no canteiro. O Obra
 
 ---
 
+## 📌 Status do Projeto
+
+![versão](https://img.shields.io/badge/vers%C3%A3o-v1.0.0-1d4ed8) ![status](https://img.shields.io/badge/status-MVP%20validado-16a34a) ![uso](https://img.shields.io/badge/uso-demonstra%C3%A7%C3%A3o%20%2F%20PoC-64748b)
+
+**v1.0.0: MVP validado.** Esta versão encerra a fase de prova de conceito. O ciclo completo funciona de ponta a ponta e foi testado com dados reais de obra:
+
+| Capacidade | Situação na v1.0.0 |
+|---|---|
+| Registro por voz + fotos + texto, com transcrição pt-BR garantida | ✅ Funcional |
+| IA multimodal: tarefas por cômodo e **vínculo visual foto ↔ tarefa** (`foto_indices`) | ✅ Funcional, com fallback offline |
+| Checklist por ambiente, dossiê por tarefa, busca global e filtros | ✅ Funcional |
+| Privacidade das fotos (EXIF/GPS removidos, nomes UUID) e PIN de acesso | ✅ Funcional |
+| Exportação ZIP As-Built organizada por obra/cômodo, **deduplicada por SHA-256** | ✅ Funcional |
+| Relatório HTML/PDF e resumo para WhatsApp | ✅ Funcional |
+
+**Escopo e limites:** a v1.0.0 serve para **demonstração e prova de conceito**. Ela roda como instância única (uma equipe, um servidor, banco SQLite local) e não deve ser tratada como ambiente de produção multi-cliente. A evolução para produção está descrita em [Evolução Arquitetural (Roadmap V2)](#7-evolução-arquitetural-roadmap-v2). A V2 será desenvolvida em um **repositório dedicado**, e este repositório fica congelado como referência do MVP.
+
+---
+
 ## 1. A dor de negócio
 
 Pequenos empreiteiros e prestadores de reforma (o mercado das "obras da Dona Maria") perdem dinheiro e confiança em três pontos:
@@ -30,7 +49,7 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
 3. **Transcrição garantida do áudio (pt-BR)**: antes de qualquer análise, `ai_service.transcrever_audio_garantido` converte a fala em texto com a biblioteca `SpeechRecognition` (reconhecimento de voz gratuito do Google). Qualquer áudio é convertido para WAV PCM 16 kHz mono (`pydub` + ffmpeg do `imageio-ffmpeg`) e dividido em trechos de até 35 s, cortados num silêncio para não partir palavras. Assim, relatos de mais de 1 minuto são transcritos por inteiro. Esse texto literal vai para `transcricao_audio`, aparece aberto logo abaixo do player (🎙️ *O que foi falado no áudio: "..."*) e é a base do resumo, dos detalhes e das tarefas, com ou sem IA. Sem IA disponível, as regras locais quebram a fala (sem pontuação) em tarefas por cômodo. Registros antigos sem transcrição ganham o botão **🔄 Transcrever o áudio agora**, que transcreve o áudio salvo, refaz o resumo do dia e cria/atualiza as tarefas por ambiente (mantendo o status marcado no checklist) e liga as fotos soltas ao serviço certo. O áudio é enviado ao serviço de voz do Google, por isso é preciso internet.
    **IA multimodal (Gemini 3.x Flash)**: recebe a transcrição literal junto com o áudio e as fotos, cruza tudo com o **contexto da obra** e devolve um JSON validado:
    - `transcricao_audio`: transcrição literal e completa do relato;
-   - `tarefas_extraidas`: cada serviço falado vira um bloco **por cômodo**, com `resumo_servico` e `detalhes_servico` **exclusivos** daquele serviço (um relato sobre banheiro e vala gera uma tarefa do Banheiro e outra da Área Externa, sem misturar os textos). O analisador local faz a mesma separação: remove saudações/despedidas, quebra a fala sem pontuação em trechos e agrupa os trechos por ambiente ("tirei a cerâmica do banheiro social e passei cano na cozinha" → 2 tarefas), marcada como feita ou pendente;
+   - `tarefas_extraidas`: cada serviço falado vira um bloco **por cômodo**, com `resumo_servico`, `detalhes_servico` **exclusivos** daquele serviço e `foto_indices`, a lista das imagens que mostram visualmente aquela tarefa (ver [vínculo multimodal](#vínculo-multimodal-foto--tarefa)) (um relato sobre banheiro e vala gera uma tarefa do Banheiro e outra da Área Externa, sem misturar os textos). O analisador local faz a mesma separação: remove saudações/despedidas, quebra a fala sem pontuação em trechos e agrupa os trechos por ambiente ("tirei a cerâmica do banheiro social e passei cano na cozinha" → 2 tarefas), marcada como feita ou pendente;
    - `resumo_executivo`: atividades do dia em linguagem técnica para a cliente;
    - `detalhes_execucao_imprevistos`: particularidades técnicas do serviço, dificuldades do terreno/estrutura, clima ou justificativas de prazo. Não há nota de produtividade: serviços complexos levam mais tempo sem que isso seja baixa produtividade;
    - `motivo_atraso`: chuva, faltas ou problemas técnicos, redigidos como justificativa de prazo;
@@ -43,7 +62,7 @@ O registro de campo **precisa custar menos de um minuto**, senão ninguém faz. 
 5. **Histórico e Diários**: linha do tempo por obra com player do áudio original, detalhes de execução/imprevistos, alertas de atraso e as fotos do dia. Cada registro pode ser editado (para corrigir a transcrição, por exemplo) ou excluído com confirmação (tarefas e fotos podem ser mantidas na obra).
 6. **🖼️ Galeria da Obra & Relatórios**:
    - **Galeria por ambiente e serviço**: as fotos ficam na tabela `midias_obra`, ligadas a ambiente, serviço e, quando houver, ao registro e à tarefa. Cada cômodo é um bloco com título em destaque (`🚿 Banheiro`); dentro dele, cada serviço tem um subtítulo (*Retirada da cerâmica do banheiro — 11/11/2026*) e a grade das fotos, com 🔍 ampliar, ✏️ editar ambiente/serviço/descrição e 🗑️ excluir. Há botões para adicionar fotos em qualquer ambiente, e filtros por ambiente e palavra-chave. Funciona como manual de manutenção da obra.
-   - **📦 ZIP para a arquiteta**: as fotos vêm em subpastas por ambiente (`Banheiro_Social/01_2026-11-11_retirada_da_ceramica.jpg`, `Cozinha/...`), mais o `Memorial_Descritivo_AsBuilt.txt` com a descrição de cada foto, o histórico e o checklist. O ZIP é gerado em memória, na hora do clique.
+   - **📦 ZIP para a arquiteta**: pasta da obra com as fotos em subpastas por cômodo, sem arquivos repetidos, mais o relatório e o memorial descritivo na raiz. O ZIP é gerado em memória, na hora do clique. Estrutura e regras em [Estrutura de Exportação](#4-estrutura-de-exportação-zip-as-built).
    - **Migração automática**: fotos de registros antigos entram em `midias_obra` ao iniciar o app, no ambiente das tarefas daquele registro (ou do cômodo citado no texto/escopo, em vez de "Área Externa" genérica).
    - **Resumo para WhatsApp**: texto pronto para copiar, com barra de progresso, serviços concluídos por cômodo e justificativas formais de atraso.
    - **Relatório completo**: HTML autocontido e estilizado para impressão (checklist, justificativas, galeria e diário), pronto para salvar em PDF.
@@ -53,7 +72,7 @@ Só dados objetivos, sem nota subjetiva do dia:
 - **Progresso do Checklist (%)**: percentual de tarefas concluídas.
 - **Tarefas Concluídas / Total**: ex.: 7/12.
 - **Dias Registrados**: dias distintos com registro no diário.
-- **Fotos Mapeadas (As-Built)**: fotos técnicas na Galeria da Obra.
+- **Fotos Mapeadas (As-Built)**: fotos técnicas na Galeria da Obra (arquivos únicos: uma foto ligada a duas tarefas conta uma vez).
 
 ### Estabilidade no navegador
 O tradutor automático do Chrome alterava textos ("anéis" → "animais") e nós do DOM controlados pelo React, derrubando a tela com `NotFoundError: removeChild`. Um script num iframe invisível marca a página como `lang="pt-BR"`, `translate="no"` e `class="notranslate"`, com a meta `google=notranslate`. Todos os widgets têm `key` única e estável.
@@ -78,7 +97,8 @@ O tradutor automático do Chrome alterava textos ("anéis" → "animais") e nós
    └──► database.py ── SQLite (obratrack.db)
             clientes_obras (1) ───< registros_diarios (N)
                    │                       │ (SET NULL ao excluir o registro)
-                   └──────< tarefas_obra (N) >┘
+                   ├──────< tarefas_obra (N) >┘
+                   └──────< midias_obra (N)   fotos ↔ ambiente / registro / tarefa (vinculo_ia)
 ```
 
 | Camada | Arquivo | Responsabilidade |
@@ -96,7 +116,7 @@ O tradutor automático do Chrome alterava textos ("anéis" → "animais") e nós
 - **Chave de API somente no backend**: a `GEMINI_API_KEY` é lida apenas do ambiente do servidor (variável de ambiente ou `.env`). A interface não recebe nem exibe a chave.
 - **Banco e mídias confinados ao diretório local**: o `obratrack.db` e a pasta `uploads\` são validados para ficarem dentro do projeto, fora de unidades de rede, e só são aceitas mídias de dentro de `uploads\`.
 - **Resiliência a 503**: o retry interno do SDK é desligado e a aplicação percorre uma cadeia de modelos. Se todos falharem, o registro é salvo com uma análise por regras locais e o usuário pode editá-lo depois. Detalhes técnicos vão só para o log do servidor; a interface nunca menciona chave, modelos ou configuração.
-- **Privacidade e compressão das fotos**: toda foto é regravada a partir apenas dos pixels. Saem GPS (endereço da cliente), data/hora original, modelo do celular, XMP e ICC; a rotação é aplicada antes. A foto é reduzida para no máximo 1600×1600 px e salva em JPEG (qualidade 78, `optimize`), o que corta 90% ou mais do tamanho. As miniaturas do relatório e as fotos do ZIP passam pelo mesmo processo.
+- **Privacidade e compressão das fotos**: toda foto é regravada a partir apenas dos pixels. Saem GPS (endereço da cliente), data/hora original, modelo do celular, XMP e ICC; a rotação é aplicada antes. A foto é reduzida com LANCZOS para no máximo 2048×2048 px e salva em JPEG (qualidade 85, `optimize`), cerca de 200–350 KB, o que preserva a nitidez de fios e conexões e ainda corta 90% ou mais do tamanho. As miniaturas do relatório e as fotos do ZIP passam pelo mesmo processo.
 - **Upload validado pelo conteúdo**: áudio só WAV, MP3 ou OGG e foto só JPEG ou PNG, reconhecidos pelos magic bytes e não pela extensão. Limite de 15 MB, também no servidor (`server.maxUploadSize`). O arquivo é salvo como `uploads\<uuid4>.<ext>`, sem nome original, nome do cliente ou data.
 - **Textos higienizados**: entradas com `strip`, sem caracteres de controle e com limite de tamanho. Todo texto inserido em HTML customizado passa por `html.escape`, contra XSS nos cards e no relatório.
 - **PIN de acesso opcional** (`APP_PIN`): sem o PIN nenhum dado de cliente é renderizado. Após 5 erros, a origem fica bloqueada por 5 minutos, mesmo recarregando a página. A comparação usa `hmac.compare_digest`.
@@ -104,7 +124,46 @@ O tradutor automático do Chrome alterava textos ("anéis" → "animais") e nós
 - **Interface sem menus técnicos e com modo escuro**: `.streamlit/config.toml` com `toolbarMode = "viewer"` (sem Rerun, Clear cache e Deploy, mas com o menu ⋮ > Settings para trocar o tema), `showErrorDetails = "none"` (sem traceback na tela) e `gatherUsageStats = false`. O tema padrão é o escuro, com paletas executivas para os temas escuro e claro. O CSS esconde só o rodapé e o botão Deploy, e usa cores translúcidas que funcionam nos dois temas.
 - **Configuração do servidor**: `GEMINI_API_KEY` (obrigatória para IA), `APP_PIN` (opcional), `OBRATRACK_MODELOS` (ordem da cadeia, separada por vírgula) e `OBRATRACK_MODO_OFFLINE=1` (força a análise offline em testes).
 
-## 4. Como rodar (Windows PowerShell)
+## 4. Estrutura de Exportação (ZIP As-Built)
+
+O botão **📦 Baixar Fotos da Obra** gera `{slug-da-obra}_{AAAAMMDD}.zip`. Exemplo de uma obra com relatos sobre banheiro e área externa:
+
+```text
+reforma-banheiro-dona-maria_20261122.zip
+└── reforma-banheiro-dona-maria/                         ← slug da obra (sanitize_slug)
+    ├── relatorio_obra.html                              ← relatório completo; as imagens apontam para os .jpg abaixo
+    ├── memorial_descritivo_asbuilt.txt                  ← resumo + índice: foto → tarefas, tarefa → fotos
+    ├── area-externa/                                    ← slug do cômodo
+    │   ├── 2026-11-12_escavacao-da-vala-de-drenagem_01.jpg
+    │   └── 2026-11-12_multiplas-tarefas_01.jpg          ← 1 imagem, 2 tarefas (escavação + anéis): gravada UMA vez
+    ├── banheiro-social/
+    │   ├── 2026-11-11_retirada-da-ceramica_01.jpg
+    │   └── 2026-11-11_retirada-da-ceramica_02.jpg       ← sequência por data + tarefa
+    └── geral/                                           ← fotos sem cômodo específico
+        └── 2026-11-12_registro-fotografico-do-dia_01.jpg
+
+Nome de cada foto: {data}_{slug-da-tarefa}_{sequência}.jpg
+```
+
+#### Deduplicação por conteúdo (SHA-256)
+- Antes de gravar cada `.jpg`, o gerador calcula `hashlib.sha256(bytes_da_foto).hexdigest()` sobre os bytes exatamente como vão para o ZIP.
+- Um registro de `(slug_comodo, sha256)` impede gravar o mesmo conteúdo duas vezes na mesma pasta, mesmo que venha de **arquivos diferentes**. Isso inclui uma foto reenviada ou um registro antigo que duplicou o arquivo para duas tarefas.
+- A foto duplicada não é gravada de novo, mas **continua referenciada**. O memorial lista o arquivo em cada tarefa (`foto: reforma-banheiro-dona-maria/area-externa/...`), e o relatório HTML a mostra em cada serviço, sem embutir cópias em base64.
+- O mesmo conteúdo em cômodos **diferentes** gera uma cópia por pasta, porque cada pasta precisa ser completa sozinha para quem for fazer a manutenção daquele cômodo.
+- Imagem com várias tarefas recebe o nome neutro `multiplas-tarefas`, para não parecer que pertence só à primeira. A sequência conta por data + tarefa e nunca sobrescreve.
+
+#### Vínculo multimodal foto ↔ tarefa
+- Cada foto vai ao Gemini precedida do rótulo `Imagem 0:`, `Imagem 1:`… Cada tarefa extraída devolve `foto_indices` com **somente** as imagens que mostram visualmente aquele serviço (`[0, 2]`). Estar no mesmo cômodo não basta.
+- Uma imagem que mostra duas tarefas (vala escavada com anéis instalados) pode entrar nas duas. Com 10 fotos de coisas diferentes, cada tarefa recebe só as suas.
+- Foto que não corresponde a nenhuma tarefa fica **apenas no registro do cômodo**, marcada com `midias_obra.vinculo_ia = 1`. Assim ela não é puxada depois para tarefas erradas pelas regras automáticas de vínculo por ambiente. Fotos antigas ou manuais (`vinculo_ia` nulo) mantêm o comportamento anterior, sem nenhuma alteração no banco existente.
+- Sem IA disponível (modo offline, sem visão), a foto só é ligada se houver uma única tarefa. Com várias tarefas, ela fica solta no registro.
+
+#### Segurança da exportação
+- Todo segmento de caminho passa por `security.sanitize_slug`, que remove acentos, espaços e símbolos e impede `../` e nomes reservados do Windows. Depois, `_caminho_zip` recusa qualquer segmento fora do padrão de slug, como segunda barreira contra *zip slip*.
+- As fotos saem sem EXIF/GPS. Fotos legadas são regravadas como JPEG limpo antes de entrar no ZIP.
+- Os nomes organizados existem só dentro do ZIP. No servidor e no banco, as fotos seguem com nome UUID.
+
+## 5. Como rodar (Windows PowerShell)
 
 Pré-requisitos: Python 3.11+ e uma chave do Gemini ([Google AI Studio](https://aistudio.google.com/apikey)).
 
@@ -132,7 +191,7 @@ Abra `http://localhost:8501`. O banco e as obras de exemplo ("Reforma Banheiro -
 **Testar pelo celular na mesma rede Wi-Fi**: use o endereço *Network URL* que o Streamlit mostra no terminal (ex.: `http://192.168.0.10:8501`).
 > O navegador só libera o microfone em **HTTPS ou localhost**. Para gravar áudio pelo celular, publique no Streamlit Community Cloud ou use um túnel HTTPS (ex.: `cloudflared tunnel --url http://localhost:8501`). Pela rede local, foto e texto funcionam normalmente.
 
-## 5. Estrutura
+## 6. Estrutura do código
 
 ```
 obratrack-ai\
@@ -148,11 +207,65 @@ obratrack-ai\
 └── uploads\          # áudios e fotos por obra (ignorado no git)
 ```
 
-## 6. Roadmap
+## 7. Evolução Arquitetural (Roadmap V2)
 
+A v1.0.0 cumpriu o objetivo de **validar o produto**: o fluxo voz + foto → diário técnico → checklist → As-Built resolve a dor do canteiro. Os limites que restam não são de funcionalidade, mas de **arquitetura**. Por isso a V2 será desenvolvida em um **repositório dedicado**, e não como refatoração incremental deste código.
+
+### Por que a stack atual não escala para produção
+
+| Limite da v1 (Streamlit + SQLite) | Impacto no canteiro de obras |
+|---|---|
+| **Streamlit mantém o estado no servidor por WebSocket** e roda o script inteiro a cada interação | Em 3G/4G instável, cada queda de conexão reinicia a sessão. Fotos no buffer e formulários meio preenchidos podem se perder, e cada toque exige ida e volta ao servidor. |
+| **Sem modo offline** no navegador | Subsolo, laje e zona rural ficam sem sinal. O registro precisa ser feito na hora, não "quando voltar o 4G". |
+| **SQLite em arquivo local**, escrita serializada, um único processo | Não suporta várias equipes gravando ao mesmo tempo nem escalar horizontalmente. O backup depende do disco do servidor. |
+| **Isolamento por instância** (um PIN, um banco) | Não há separação de dados entre empresas. Atender vários empreiteiros exigiria uma instalação por cliente. |
+| **Mídia em pasta local** servida pela própria aplicação | Não há controle de acesso por arquivo nem CDN, e o disco do servidor é ponto único de falha. |
+
+### Arquitetura alvo
+
+```text
+ React PWA (Service Worker + IndexedDB)            FastAPI (async, Pydantic v2)
+ ┌──────────────────────────────┐  HTTPS/JSON  ┌──────────────────────────────────┐
+ │ captura offline: áudio, fotos│ ───────────► │ auth JWT · fila de análise IA    │
+ │ fila de sincronização        │ ◄─────────── │ (Gemini multimodal, foto_indices)│
+ │ compressão/EXIF no aparelho  │  URL assinada└───────┬──────────────────┬───────┘
+ └──────────────┬───────────────┘                      │                  │
+                │ PUT direto (URL assinada, curta)     ▼                  ▼
+                ▼                              PostgreSQL + RLS     Storage privado
+         Storage privado ◄──────────────────── (tenant_id em todas  (bucket sem acesso
+         (S3 / Supabase Storage)                as tabelas)          público)
+```
+
+- **React PWA, pensado para redes móveis de canteiro**:
+  - um *Service Worker* deixa o app abrir e funcionar sem conexão;
+  - áudios, fotos e registros ficam numa **fila local em IndexedDB** e são enviados em segundo plano quando o sinal volta, com novas tentativas (*background sync*). Nenhum registro se perde por queda de rede;
+  - a compressão e a remoção de EXIF/GPS rodam **no próprio aparelho**, o que reduz o tráfego de 4–12 MB para cerca de 300 KB por foto antes do envio;
+  - a interface responde na hora, sem ida e volta ao servidor a cada toque, e pode ser instalada na tela inicial como app.
+- **FastAPI**:
+  - API REST *stateless* e assíncrona: uma conexão que cai não destrói a sessão de ninguém, e a API escala horizontalmente;
+  - os **schemas Pydantic da v1 (`AnaliseDiarioObra`, `ItemTarefa.foto_indices`) são reaproveitados** como contrato da API e da saída estruturada do Gemini;
+  - a análise de IA vira tarefa assíncrona em fila: o upload termina logo e o resultado chega quando estiver pronto, em vez de travar a requisição por até 60 s.
+- **PostgreSQL com Row Level Security (multi-tenant)**:
+  - todas as tabelas recebem `tenant_id` (empresa), e políticas RLS como `USING (tenant_id = current_setting('app.tenant_id')::uuid)` fazem o **próprio banco** recusar linhas de outra empresa;
+  - o isolamento não depende de lembrar um `WHERE` em cada consulta: um bug na API não vaza dados entre empreiteiros;
+  - perfis (encarregado, engenheiro, cliente final) viram políticas por papel;
+  - de quebra: concorrência real (MVCC), backups *point-in-time* e busca textual em português (`unaccent` + `tsvector`), no lugar do `norm()` + `LIKE` atuais.
+- **Storage privado com URLs assinadas**:
+  - fotos e áudios ficam num bucket **sem acesso público**;
+  - a API, depois de checar o tenant e a permissão, emite **URLs assinadas de curta duração**, tanto para o envio direto do celular ao storage quanto para visualizar e baixar;
+  - o arquivo não passa pelo servidor de aplicação, e um link vazado expira em minutos;
+  - a deduplicação por SHA-256 da v1 evolui para **armazenamento endereçado por conteúdo**: o hash vira a chave do objeto, e a mesma foto ligada a várias tarefas existe uma única vez no storage.
+
+### O que é preservado da v1
+As regras de negócio validadas no MVP migram como estão:
+- separação de tarefas por cômodo e correção de ambiente por palavras-chave;
+- vínculo visual `foto_indices` e o marcador `vinculo_ia`;
+- transcrição pt-BR garantida e fallback offline quando a IA cai;
+- sanitização de nomes (`sanitize_slug`) e estrutura do ZIP As-Built deduplicado;
+- regra de que **nenhum registro de campo se perde**.
+
+### Backlog de produto (pós-V2)
 - [ ] Exportação nativa em PDF com assinatura da cliente
-- [ ] Captura de geolocalização e data/hora da foto (EXIF) como prova adicional
+- [ ] Geolocalização e data/hora da foto, coletadas pelo app e guardadas separadas da imagem, como prova adicional sem expor o EXIF
 - [ ] Integração com a previsão do tempo para validar justificativas climáticas
-- [ ] Multiusuário (encarregado × engenheiro × cliente) com autenticação
 - [ ] Planta baixa com marcação visual das tubulações mapeadas
-- [ ] Migração do SQLite para PostgreSQL e da mídia para armazenamento em nuvem

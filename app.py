@@ -504,37 +504,56 @@ def vincular_fotos_do_registro(
     fotos_salvas: list[tuple[str, int]],
     tarefas_novas: list[dict],
 ) -> list[int]:
-    """Grava em midias_obra as fotos de um registro, cada uma no seu ambiente e serviço.
+    """Grava em midias_obra as fotos de um registro, ligando cada uma SÓ às tarefas que ela mostra.
 
-    Usa a classificação da IA por foto; sem ela, a tarefa principal do relato (ex.: "foi
-    retirado a cerâmica do banheiro" → ambiente Banheiro, serviço "Retirada da cerâmica...");
-    sem tarefas, o cômodo citado no relato ou no escopo da obra.
+    Com a IA (análise visual): cada tarefa traz `foto_indices` (Imagem 0, 1, 2...). A foto vira
+    uma linha por tarefa que a citou (mesmo arquivo; no ZIP ela é deduplicada por conteúdo).
+    Foto que nenhuma tarefa citou fica solta no registro, no cômodo que a IA classificou, marcada
+    com vinculo_ia=1 para não ser puxada depois para tarefas erradas do mesmo cômodo.
+
+    Sem a IA (modo offline, sem visão): com uma única tarefa, a foto vai para ela; com várias, a
+    foto fica solta no registro (não há como saber qual tarefa ela mostra).
     """
     classificadas = {f.indice_foto: f for f in analise.fotos_classificadas}
     if db.SEM_FOTO_ASBUILT.lower() in (dados.get("mapeamento_asbuilt") or "").lower():
         dados = {**dados, "mapeamento_asbuilt": ""}
-    principal = next((t for t in tarefas_novas if t["concluida"]), tarefas_novas[0] if tarefas_novas else None)
+    visual = not analise.modo_offline
     relato = f"{analise.transcricao_audio} {obs}"
+    escopo = obra.get("escopo_resumo") or ""
+
+    def ambiente_solto() -> str:
+        """Cômodo de uma foto sem tarefa: o das tarefas (se todas forem do mesmo) ou o do relato/escopo."""
+        ambientes = {db.normalizar_busca(t["ambiente"]): t["ambiente"] for t in tarefas_novas}
+        if len(ambientes) == 1:
+            return next(iter(ambientes.values()))
+        internos = [a for a in db.ambientes_citados(escopo) if a not in db.AMBIENTES_EXTERNOS]
+        return db.detectar_ambiente(relato, escopo, padrao=internos[0] if len(internos) == 1 else "Geral")
+
+    def gravar(caminho: str, tamanho: int, amb: str, titulo: str, descricao: str, tarefa_id: int | None) -> int:
+        return db.inserir_midia_obra(
+            obra["id"], caminho, sanitize_text(amb, LIM_AMBIENTE) or "Geral",
+            sanitize_text(titulo, LIM_TAREFA) or "Registro fotográfico do dia",
+            sanitize_text(descricao, LIMITE_TEXTO_LONGO), registro_id=registro_id, tarefa_id=tarefa_id,
+            data_midia=data_iso, foto_bytes_original=tamanho, vinculo_ia=visual,
+        )
+
     ids = []
-    for i, (caminho, tamanho) in enumerate(fotos_salvas, start=1):
-        cls, tarefa = classificadas.get(i), principal
-        if cls:
-            amb = sanitize_text(cls.ambiente, LIM_AMBIENTE) or "Geral"
-            mesmo_amb = [t for t in tarefas_novas if db.normalizar_busca(t["ambiente"]) == db.normalizar_busca(amb)]
-            tarefa = next((t for t in mesmo_amb if t["concluida"]), mesmo_amb[0] if mesmo_amb else None)
-            titulo, descricao = cls.titulo_servico, cls.descricao_tecnica or dados["mapeamento_asbuilt"]
-        elif tarefa:
-            amb, titulo, descricao = tarefa["ambiente"], tarefa["descricao"], dados["mapeamento_asbuilt"]
+    for i, (caminho, tamanho) in enumerate(fotos_salvas):  # i = índice enviado à IA (Imagem 0, 1...)
+        cls = classificadas.get(i)
+        descricao = (cls.descricao_tecnica if cls else "") or dados["mapeamento_asbuilt"]
+        if visual:
+            alvos = [t for t in tarefas_novas if i in t.get("foto_indices", ())]
         else:
-            escopo = obra.get("escopo_resumo") or ""
-            internos = [a for a in db.ambientes_citados(escopo) if a not in db.AMBIENTES_EXTERNOS]
-            amb = db.detectar_ambiente(relato, escopo, padrao=internos[0] if len(internos) == 1 else "Geral")
-            titulo, descricao = "Registro fotográfico do dia", dados["mapeamento_asbuilt"]
-        ids.append(db.inserir_midia_obra(
-            obra["id"], caminho, amb, sanitize_text(titulo, LIM_TAREFA) or "Registro fotográfico do dia",
-            sanitize_text(descricao, LIMITE_TEXTO_LONGO), registro_id=registro_id,
-            tarefa_id=tarefa["id"] if tarefa else None, data_midia=data_iso, foto_bytes_original=tamanho,
-        ))
+            alvos = tarefas_novas[:1] if len(tarefas_novas) == 1 else []
+        if alvos:
+            for t in alvos:
+                # Foto de uma tarefa só: o título visual da IA; compartilhada: o nome de cada tarefa.
+                titulo = cls.titulo_servico if cls and len(alvos) == 1 and cls.titulo_servico else t["descricao"]
+                ids.append(gravar(caminho, tamanho, t["ambiente"], titulo, descricao, t["id"]))
+        else:
+            amb = (cls.ambiente if cls else "") or ambiente_solto()
+            titulo = (cls.titulo_servico if cls else "") or "Registro fotográfico do dia"
+            ids.append(gravar(caminho, tamanho, amb, titulo, descricao, None))
     return ids
 
 
@@ -689,7 +708,9 @@ def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict],
         for (servico, data_m), itens in servicos.items():
             vistas: set[str] = set()  # a mesma foto não se repete dentro do mesmo serviço/dia
             for m, foto in itens:
-                if (chave := _chave_arquivo(foto)) in vistas:
+                # No ZIP o caminho relativo já reflete a deduplicação por conteúdo (sha256).
+                chave = fotos_relativas.get(m["id"], "") if fotos_relativas is not None else _chave_arquivo(foto)
+                if chave in vistas:
                     continue
                 vistas.add(chave)
                 if fotos_relativas is not None:
@@ -812,6 +833,10 @@ def _chave_arquivo(foto: Path) -> str:
     return os.path.normcase(str(foto.resolve()))
 
 
+def _sha256(dados: bytes) -> str:
+    return hashlib.sha256(dados).hexdigest()
+
+
 def _unicos(valores) -> list:
     """Valores não vazios, sem repetição, na ordem em que aparecem."""
     return list(dict.fromkeys(v.strip() for v in valores if v and str(v).strip()))
@@ -846,12 +871,16 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
     """
     s = sanitize_text
     raiz = slug_obra(obra)
-    # Deduplicação: {(pasta, arquivo físico): [linhas do banco]}. A mesma foto vinculada a várias
-    # tarefas do mesmo cômodo vira UMA entrada no ZIP; em cômodos diferentes, uma por pasta.
+    # Deduplicação por CONTEÚDO: {(pasta, sha256 dos bytes da foto): [linhas do banco]}. A mesma
+    # imagem (mesmo arquivo, ou arquivos diferentes com bytes idênticos, ex.: reenviada) ligada a
+    # várias tarefas do mesmo cômodo vira UMA entrada no ZIP; em cômodos diferentes, uma por pasta.
     # Cômodos que só diferem em acento/maiúscula caem na mesma pasta.
+    hash_por_arquivo: dict[str, str] = {}  # arquivo físico -> sha256 (cada arquivo é lido uma vez aqui)
     grupos: dict[tuple[str, str], list[tuple[dict, Path]]] = {}
     for m, foto in sorted(midias_com_arquivo(midias), key=lambda x: (x[0].get("data_midia") or "", x[0]["id"])):
-        grupos.setdefault((_pasta_comodo(m.get("ambiente")), _chave_arquivo(foto)), []).append((m, foto))
+        if (arq := _chave_arquivo(foto)) not in hash_por_arquivo:
+            hash_por_arquivo[arq] = _sha256(_bytes_foto_para_zip(foto)[0])
+        grupos.setdefault((_pasta_comodo(m.get("ambiente")), hash_por_arquivo[arq]), []).append((m, foto))
     pastas: dict[str, list[list[tuple[dict, Path]]]] = {}
     for (pasta, _), linhas in grupos.items():
         pastas.setdefault(pasta, []).append(linhas)
@@ -878,7 +907,8 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
     ]
     buf = io.BytesIO()
     usados: set[str] = set()  # nomes já gravados no ZIP
-    gravadas: dict[tuple[str, str], str] = {}  # (pasta, arquivo físico) -> nome no ZIP
+    # Set de (slug_comodo, sha256) já gravados, com o nome usado (para manter a referência).
+    gravadas: dict[tuple[str, str], str] = {}
     fotos_por_tarefa: dict[int, list[str]] = {}  # tarefa_id -> nomes no ZIP (checklist do memorial)
     src_por_midia: dict[int, str] = {}  # midia_id -> caminho relativo (imagens do relatório HTML)
     with zipfile.ZipFile(buf, "w") as zf:
@@ -891,8 +921,14 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
             sequencias: dict[tuple[str, str], int] = {}  # sequência por data + tarefa dentro do cômodo
             for linhas in fotos:
                 m, foto = linhas[0]  # primeira ocorrência (mais antiga) define data e arquivo
-                chave = (pasta, _chave_arquivo(foto))
-                if chave in gravadas:  # já está nesta pasta: não grava de novo
+                dados, ext = _bytes_foto_para_zip(foto)
+                chave = (pasta, _sha256(dados))  # hash dos bytes exatamente como vão para o ZIP
+                if chave in gravadas:
+                    # Mesmo conteúdo já gravado nesta pasta: não grava de novo, só referencia.
+                    for ln, _ in linhas:
+                        src_por_midia[ln["id"]] = gravadas[chave].removeprefix(f"{raiz}/")
+                        if ln.get("tarefa_id") and ln.get("tarefa_descricao"):
+                            fotos_por_tarefa.setdefault(ln["tarefa_id"], []).append(gravadas[chave])
                     continue
                 servicos = _unicos(ln.get("titulo_servico") or "Registro fotográfico" for ln, _ in linhas)
                 tarefas_foto = {ln["tarefa_id"]: ln for ln, _ in linhas if ln.get("tarefa_id") and ln.get("tarefa_descricao")}
@@ -904,8 +940,7 @@ def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], mi
                 # Uma tarefa: nome dela. Várias tarefas na mesma foto: nome neutro, sem favorecer nenhuma.
                 tarefa_slug = slugs[0] if len(slugs) == 1 else "multiplas-tarefas"
                 data_slug = security.sanitize_slug(m.get("data_midia"), padrao="sem-data")
-                dados, ext = _bytes_foto_para_zip(foto)
-                seq = sequencias.get((data_slug, tarefa_slug), 0)
+                seq =sequencias.get((data_slug, tarefa_slug), 0)
                 while True:  # nunca sobrescreve uma entrada já gravada no ZIP
                     seq += 1
                     nome = _caminho_zip(raiz, pasta, f"{data_slug}_{tarefa_slug}_{seq:02d}{ext}")
@@ -1268,7 +1303,9 @@ def reprocessar_registro(registro_id: int) -> None:
     if not texto:
         flash("Não foi possível reconhecer a fala neste áudio agora. Tente novamente mais tarde.")
         return
-    fotos_r = midias_com_arquivo(db.listar_midias_obra(obra_id, registro_id=registro_id))
+    # Uma entrada por arquivo: a mesma foto ligada a duas tarefas não é enviada duas vezes à IA.
+    fotos_r = list({_chave_arquivo(f): (m, f) for m, f in reversed(
+        midias_com_arquivo(db.listar_midias_obra(obra_id, registro_id=registro_id)))}.values())[::-1]
     try:
         analise = processar_registro_obra(caminho_audio=audio, caminho_foto=[f for _, f in fotos_r],
                                           contexto_obra=contexto_da_obra(obra), transcricao_pronta=texto)
@@ -1278,7 +1315,7 @@ def reprocessar_registro(registro_id: int) -> None:
     longo = partial(sanitize_text, max_length=LIMITE_TEXTO_LONGO)
     # Fotos que estavam em "Geral": usa a classificação da IA (ambiente/serviço de cada foto).
     for cls in analise.fotos_classificadas:
-        m = fotos_r[cls.indice_foto - 1][0]
+        m = fotos_r[cls.indice_foto][0]  # índice base 0 (Imagem 0, Imagem 1...)
         if db.normalizar_busca(m["ambiente"]) in ("", "geral"):
             db.editar_midia_obra(m["id"], sanitize_text(cls.ambiente, LIM_AMBIENTE) or "Geral",
                                  sanitize_text(cls.titulo_servico, LIM_TAREFA) or m.get("titulo_servico") or "",
@@ -1657,7 +1694,8 @@ with aba_registro:
                     tid = db.inserir_tarefa(obra_id, novo_id, amb, desc, int(t.concluida),
                                             resumo_servico=sanitize_text(t.resumo_servico, LIMITE_TEXTO_LONGO),
                                             detalhes_servico=sanitize_text(t.detalhes_servico, LIMITE_TEXTO_LONGO))
-                    tarefas_novas.append({"id": tid, "ambiente": amb, "descricao": desc, "concluida": int(t.concluida)})
+                    tarefas_novas.append({"id": tid, "ambiente": amb, "descricao": desc, "concluida": int(t.concluida),
+                                          "foto_indices": list(t.foto_indices)})
 
             vincular_fotos_do_registro(obra, novo_id, data_reg.isoformat(), analise, dados, obs,
                                        fotos_salvas, tarefas_novas)

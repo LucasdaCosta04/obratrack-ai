@@ -134,12 +134,20 @@ class ItemTarefa(BaseModel):
     concluida: bool = Field(
         description="True se o relato diz que foi feito hoje; False se diz que ainda falta fazer ou ficou pendente."
     )
+    foto_indices: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Índices (começando em 0: Imagem 0, Imagem 1...) SOMENTE das imagens que mostram visualmente "
+            "ESTA tarefa. Lista vazia se nenhuma imagem mostrar esta tarefa. Nunca inclua uma imagem só "
+            "por ser do mesmo cômodo."
+        ),
+    )
 
 
 class ItemFoto(BaseModel):
     """Classificação de uma foto enviada no registro (na ordem de envio)."""
 
-    indice_foto: int = Field(description="Número da foto na ordem enviada, começando em 1 (FOTO 1, FOTO 2...).")
+    indice_foto: int = Field(description="Índice da imagem na ordem enviada, começando em 0 (Imagem 0, Imagem 1...).")
     ambiente: str = Field(description="Cômodo mostrado/relacionado à foto (ex.: 'Banheiro Social', 'Cozinha').")
     titulo_servico: str = Field(
         description="Serviço documentado na foto, curto e com o cômodo (ex.: 'Retirada da cerâmica do banheiro')."
@@ -251,7 +259,12 @@ Regras obrigatórias:
 5) motivo_atraso: chuvas, faltas de funcionários, falta de material ou problemas técnicos que impactaram o prazo, redigidos como justificativa formal (com horários, se citados). Se não houver, escreva exatamente '{SEM_ATRASO}'.
 6) mapeamento_asbuilt: o que as fotos mostram — posição e trajeto de tubulações (água fria/quente, esgoto), conduítes, fiação, caixas, ralos, referências de medida (distância do piso, paredes, cantos) e etapa da reforma. Sem foto, use o que o áudio descrever sobre posições; sem nenhuma informação, escreva 'Sem foto para mapeamento As-Built'.
 7) AMBIENTE (vale para tarefas e fotos): classifique pelo cômodo citado na fala, nas observações ou no escopo. Palavras como banheiro, suíte, lavabo, cozinha, sala, quarto, área de serviço definem o ambiente. Serviços internos — cerâmica, azulejo, piso, porcelanato, revestimento, rejunte, cano, tubulação, hidráulica, ralo, louças, tomadas, fiação — NUNCA são 'Área Externa': se a fala não disser o cômodo, use o cômodo do contexto da conversa ou do escopo da obra. Ex.: "foi retirado a cerâmica do banheiro" → ambiente "Banheiro" (ou "Banheiro Social"), nunca "Área Externa". Use 'Área Externa' só para quintal, jardim, fossa, vala, muro ou calçada.
-8) fotos_classificadas: uma entrada por foto recebida (FOTO 1, FOTO 2...), com o ambiente, um titulo_servico curto que cite o serviço e o cômodo (ex.: "Retirada da cerâmica do banheiro") e a descricao_tecnica do que aquela foto mostra. Sem fotos: lista vazia.
+8) fotos_classificadas: uma entrada por imagem recebida (indice_foto 0 para "Imagem 0", 1 para "Imagem 1"...), com o ambiente, um titulo_servico curto que cite o serviço e o cômodo (ex.: "Retirada da cerâmica do banheiro") e a descricao_tecnica do que aquela imagem mostra. Sem fotos: lista vazia.
+9) foto_indices (VÍNCULO VISUAL imagem ↔ tarefa): cada imagem chega rotulada como "Imagem 0", "Imagem 1"... Em cada item de tarefas_extraidas, preencha foto_indices APENAS com os índices das imagens cujo CONTEÚDO VISUAL mostra aquela tarefa específica (ex.: cerâmica sendo retirada → tarefa de retirada da cerâmica; vala aberta → tarefa de escavação).
+   - Estar no mesmo cômodo NÃO basta: com 10 imagens de coisas diferentes, cada tarefa recebe só as imagens que batem com ela.
+   - Se uma imagem mostra duas tarefas juntas (ex.: vala escavada com os anéis já instalados), o índice pode aparecer nas duas tarefas ou só na principal.
+   - Imagem que não mostra nenhuma tarefa específica (visão geral, entulho, material parado, foto sem relação clara) não entra em nenhum foto_indices.
+   - Use somente índices existentes (0 a N-1). Sem imagens: foto_indices vazio em todas as tarefas.
 """
 
 
@@ -261,9 +274,9 @@ def _montar_prompt(contexto_obra: str, observacoes_texto: str, tem_audio: bool, 
     if tem_audio:
         fontes.append("um ÁUDIO com o relato do trabalhador (fonte principal)")
     if qtd_fotos == 1:
-        fontes.append("1 FOTO do serviço executado (FOTO 1)")
+        fontes.append("1 IMAGEM do serviço executado (Imagem 0)")
     elif qtd_fotos > 1:
-        fontes.append(f"{qtd_fotos} FOTOS do serviço executado (FOTO 1 a FOTO {qtd_fotos}, na ordem enviada)")
+        fontes.append(f"{qtd_fotos} IMAGENS do serviço executado (Imagem 0 a Imagem {qtd_fotos - 1}, na ordem enviada)")
     if observacoes_texto:
         fontes.append("OBSERVAÇÕES escritas")
     fontes_txt = ", ".join(fontes) if fontes else "nenhuma mídia (apenas o contexto)"
@@ -276,6 +289,7 @@ def _montar_prompt(contexto_obra: str, observacoes_texto: str, tem_audio: bool, 
         f"{literal}"
         f"OBSERVAÇÕES ESCRITAS DO DIA:\n{observacoes_texto or 'Nenhuma.'}\n\n"
         f"Você recebeu: {fontes_txt}. Analise seguindo as regras do sistema."
+        + (" Em cada tarefa, preencha foto_indices só com as imagens que mostram aquela tarefa." if qtd_fotos else "")
     )
 
 
@@ -704,10 +718,12 @@ def _corrigir_ambientes(analise: AnaliseDiarioObra, relato: str, contexto_obra: 
     classificada como 'Área Externa' volta para 'Banheiro') e descarta fotos inexistentes."""
     for t in analise.tarefas_extraidas:
         t.ambiente = corrigir_ambiente(t.ambiente, t.descricao, relato, contexto_obra)
+        # Só índices existentes (0..N-1), sem repetição, em ordem.
+        t.foto_indices = sorted({i for i in t.foto_indices if 0 <= i < qtd_fotos})
     vistas: set[int] = set()
     fotos = []
     for f in analise.fotos_classificadas:
-        if 1 <= f.indice_foto <= qtd_fotos and f.indice_foto not in vistas:
+        if 0 <= f.indice_foto < qtd_fotos and f.indice_foto not in vistas:
             vistas.add(f.indice_foto)
             f.ambiente = corrigir_ambiente(f.ambiente, f"{f.titulo_servico} {f.descricao_tecnica}", relato, contexto_obra)
             fotos.append(f)
@@ -772,8 +788,8 @@ def processar_registro_obra(
         if audio_path:
             parte_audio, arquivo_remoto = _parte_audio(client, audio_path)
             contents.append(parte_audio)
-        for i, foto in enumerate(fotos, start=1):
-            contents += [f"FOTO {i}:", _carregar_foto(foto)]
+        for i, foto in enumerate(fotos):  # índice explícito antes de cada imagem (base 0)
+            contents += [f"Imagem {i}:", _carregar_foto(foto)]
         contents.append(
             _montar_prompt(contexto_obra, observacoes_texto, tem_audio=audio_path is not None, qtd_fotos=len(fotos),
                            transcricao_literal=transcricao_literal)

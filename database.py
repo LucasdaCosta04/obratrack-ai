@@ -327,6 +327,7 @@ def init_db() -> None:
                 caminho_foto         TEXT NOT NULL,
                 data_midia           TEXT NOT NULL,
                 foto_bytes_original  INTEGER,
+                vinculo_ia           INTEGER,
                 FOREIGN KEY (obra_id) REFERENCES clientes_obras (id) ON DELETE CASCADE,
                 FOREIGN KEY (registro_id) REFERENCES registros_diarios (id) ON DELETE SET NULL,
                 FOREIGN KEY (tarefa_id) REFERENCES tarefas_obra (id) ON DELETE SET NULL
@@ -362,6 +363,11 @@ def _migrar(conn: sqlite3.Connection) -> None:
     for coluna in ("resumo_servico", "detalhes_servico"):
         if coluna not in colunas_t:
             conn.execute(f"ALTER TABLE tarefas_obra ADD COLUMN {coluna} TEXT")
+    colunas_m = {row["name"] for row in conn.execute("PRAGMA table_info(midias_obra)")}
+    if "vinculo_ia" not in colunas_m:
+        # 1 = a IA viu a imagem e decidiu o vínculo com a tarefa (ou que não mostra nenhuma tarefa).
+        # NULL = foto antiga ou manual: continua com as regras de vínculo por ambiente de antes.
+        conn.execute("ALTER TABLE midias_obra ADD COLUMN vinculo_ia INTEGER")
     _sanear_textos_legados(conn)
     _migrar_fotos_para_midias(conn)
     _corrigir_asbuilt_sem_foto(conn)
@@ -789,7 +795,9 @@ def _vincular_fotos_soltas(conn: sqlite3.Connection, registro_id: int) -> int:
         return 0
     alteradas = 0
     for m in conn.execute(
-        "SELECT id, ambiente, titulo_servico FROM midias_obra WHERE registro_id = ? AND tarefa_id IS NULL",
+        # vinculo_ia = 1: a IA já viu a imagem e decidiu que ela não mostra nenhuma tarefa; não forçar.
+        "SELECT id, ambiente, titulo_servico FROM midias_obra "
+        "WHERE registro_id = ? AND tarefa_id IS NULL AND vinculo_ia IS NULL",
         (registro_id,),
     ).fetchall():
         mesma = next((t for t in tarefas if _mesmo_ambiente(t["ambiente"], m["ambiente"])), None)
@@ -1028,9 +1036,10 @@ _COLUNAS_DOSSIE_MIDIA = (
 
 def _cond_midia_da_tarefa(m: str) -> str:
     """Fotos que documentam a tarefa `b`: vinculadas a ela ou, se soltas (sem tarefa), do
-    mesmo ambiente e do mesmo registro/dia. Fotos de OUTRA tarefa nunca entram."""
+    mesmo ambiente e do mesmo registro/dia. Fotos de OUTRA tarefa nunca entram, nem fotos soltas
+    que a IA já analisou e não ligou a nenhuma tarefa (vinculo_ia = 1: ficam só no registro do cômodo)."""
     return (
-        f"{m}.obra_id = b.obra_id AND ({m}.tarefa_id = b.id OR ({m}.tarefa_id IS NULL "
+        f"{m}.obra_id = b.obra_id AND ({m}.tarefa_id = b.id OR ({m}.tarefa_id IS NULL AND {m}.vinculo_ia IS NULL "
         f"AND {m}.ambiente = b.ambiente AND ({m}.registro_id = b.reg_id OR {m}.data_midia = b.data_tarefa)))"
     )
 
@@ -1243,22 +1252,27 @@ def inserir_midia_obra(
     tarefa_id: Optional[int] = None,
     data_midia: Optional[str] = None,
     foto_bytes_original: Optional[int] = None,
+    vinculo_ia: bool = False,
 ) -> int:
     """Vincula uma foto (já salva em uploads\\) à obra, a um ambiente e, opcionalmente, a um
-    registro diário e/ou tarefa. Retorna o id da mídia."""
+    registro diário e/ou tarefa. Retorna o id da mídia.
+
+    `vinculo_ia=True`: o vínculo (ou a ausência de tarefa) foi decidido pela análise visual da
+    IA, e a foto solta não é religada automaticamente por ambiente depois."""
     if caminho_midia_seguro(caminho_foto) is None:
         raise CaminhoInseguroError(f"Caminho de foto fora da pasta uploads: {caminho_foto}")
     with get_connection() as conn:
         cur = conn.execute(
             """
             INSERT INTO midias_obra (obra_id, registro_id, tarefa_id, ambiente, titulo_servico,
-                                     descricao_tecnica, caminho_foto, data_midia, foto_bytes_original)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     descricao_tecnica, caminho_foto, data_midia, foto_bytes_original, vinculo_ia)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 obra_id, registro_id, tarefa_id, _normalizar_ambiente(ambiente),
                 (titulo_servico or "").strip(), (descricao_tecnica or "").strip(),
                 str(Path(caminho_foto)), data_midia or date.today().isoformat(), foto_bytes_original,
+                1 if vinculo_ia else None,
             ),
         )
         return int(cur.lastrowid)

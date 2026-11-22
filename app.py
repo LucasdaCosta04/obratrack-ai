@@ -470,9 +470,24 @@ def salvar_fotos(
     registro_id: int | None = None,
     data_midia: str | None = None,
 ) -> tuple[int, list[str]]:
-    """Valida, comprime e vincula as fotos enviadas a um ambiente/serviço (e tarefa/registro).
+    """Valida, limpa e grava fotos enviadas manualmente para um ambiente/serviço.
 
-    Retorna (quantidade salva, mensagens de erro seguras para o usuário).
+    Usado na galeria e no 📷 de cada tarefa. Cada arquivo passa por
+    `security.validate_and_save_media` (sem EXIF/GPS, JPEG, nome UUID).
+
+    Args:
+        arquivos: Arquivos do uploader ou fotos do buffer da câmera (`getvalue()`).
+        obra_id: Obra das fotos.
+        ambiente: Cômodo escolhido (vazio vira "Geral").
+        titulo_servico: Serviço mostrado nas fotos.
+        descricao_tecnica: Descrição As-Built.
+        tarefa_id: Tarefa vinculada, se houver.
+        registro_id: Registro vinculado, se houver.
+        data_midia: Data ISO (padrão: hoje).
+
+    Returns:
+        Tupla (quantidade salva, mensagens de erro seguras para exibir ao usuário). Só as
+        `MAX_FOTOS_ENVIO` primeiras fotos são processadas.
     """
     salvas, erros = 0, []
     for i, arq in enumerate(arquivos[:MAX_FOTOS_ENVIO], start=1):
@@ -504,15 +519,29 @@ def vincular_fotos_do_registro(
     fotos_salvas: list[tuple[str, int]],
     tarefas_novas: list[dict],
 ) -> list[int]:
-    """Grava em midias_obra as fotos de um registro, ligando cada uma SÓ às tarefas que ela mostra.
+    """Grava as fotos de um registro novo, ligando cada uma só às tarefas que ela mostra.
 
-    Com a IA (análise visual): cada tarefa traz `foto_indices` (Imagem 0, 1, 2...). A foto vira
-    uma linha por tarefa que a citou (mesmo arquivo; no ZIP ela é deduplicada por conteúdo).
-    Foto que nenhuma tarefa citou fica solta no registro, no cômodo que a IA classificou, marcada
-    com vinculo_ia=1 para não ser puxada depois para tarefas erradas do mesmo cômodo.
+    Regras de negócio:
+        - com IA (análise visual): cada tarefa traz `foto_indices` (Imagem 0, 1, 2...). A foto
+          vira uma linha por tarefa que a citou, com o mesmo arquivo (no ZIP ela é
+          deduplicada por conteúdo);
+        - foto que nenhuma tarefa citou fica solta no registro, no cômodo classificado pela IA,
+          com `vinculo_ia = 1`, para não ser puxada depois para tarefas erradas do cômodo;
+        - sem IA (modo offline): com uma única tarefa, a foto vai para ela; com várias, fica
+          solta, porque não há como saber qual tarefa ela mostra.
 
-    Sem a IA (modo offline, sem visão): com uma única tarefa, a foto vai para ela; com várias, a
-    foto fica solta no registro (não há como saber qual tarefa ela mostra).
+    Args:
+        obra: Obra do registro (usa id e escopo).
+        registro_id: Registro recém-inserido.
+        data_iso: Data do registro.
+        analise: `AnaliseDiarioObra` usada para salvar o registro.
+        dados: Campos já saneados da análise (usa `mapeamento_asbuilt` como descrição padrão).
+        obs: Observações digitadas (ajudam a deduzir o cômodo das fotos soltas).
+        fotos_salvas: Pares (caminho, tamanho original) na mesma ordem enviada à IA.
+        tarefas_novas: Tarefas inseridas, com id, ambiente, descricao, concluida e foto_indices.
+
+    Returns:
+        Ids das linhas criadas em `midias_obra`.
     """
     classificadas = {f.indice_foto: f for f in analise.fotos_classificadas}
     if db.SEM_FOTO_ASBUILT.lower() in (dados.get("mapeamento_asbuilt") or "").lower():
@@ -662,7 +691,19 @@ def gerar_resumo_whatsapp(obra: dict, registros: list[dict], tarefas: list[dict]
 
 
 def imagem_base64(caminho: Path, lado_max: int = 900) -> str | None:
-    """Miniatura JPEG em base64, sem metadados, para embutir no relatório HTML."""
+    """Gera uma miniatura JPEG sem metadados, em base64, para embutir no relatório HTML.
+
+    Args:
+        caminho: Foto em uploads.
+        lado_max: Maior lado da miniatura, em pixels.
+
+    Returns:
+        Texto base64 do JPEG, ou None se a imagem não puder ser lida.
+
+    Note:
+        Segurança: a miniatura é refeita por `security.imagem_sem_metadados`, então nenhum
+        GPS/EXIF de fotos antigas vai para o relatório.
+    """
     try:
         with Image.open(caminho) as img:
             img.thumbnail((lado_max, lado_max))
@@ -676,11 +717,22 @@ def imagem_base64(caminho: Path, lado_max: int = 900) -> str | None:
 
 def gerar_relatorio_html(obra: dict, registros: list[dict], tarefas: list[dict], midias: list[dict],
                          fotos_relativas: dict[int, str] | None = None) -> str:
-    """Relatório autocontido (fotos embutidas, sem metadados) para enviar ou imprimir em PDF.
+    """Gera o relatório da obra em HTML único, para enviar ou imprimir em PDF.
 
-    Com `fotos_relativas` ({midia_id: caminho relativo}), usado dentro do ZIP, as imagens apontam
-    para os arquivos das pastas em vez de base64: uma foto compartilhada por várias tarefas aparece
-    em cada uma delas, mas existe uma única vez no ZIP.
+    Contém indicadores, checklist por ambiente, justificativas de prazo, galeria As-Built
+    por ambiente e serviço, e o diário. Todo texto do usuário passa por `esc` (escape HTML).
+
+    Args:
+        obra: Dados da obra.
+        registros: Registros diários.
+        tarefas: Tarefas do checklist.
+        midias: Linhas de `midias_obra` (uma foto pode aparecer em várias).
+        fotos_relativas: Mapa {midia_id: caminho relativo no ZIP}. Se informado (uso dentro
+            do ZIP), as imagens apontam para os .jpg das pastas em vez de base64, e uma foto
+            compartilhada aparece em cada tarefa sem existir duas vezes no ZIP.
+
+    Returns:
+        Documento HTML completo.
     """
     k = indicadores(registros, tarefas, midias)
     cronologicos = sorted(registros, key=lambda r: (r["data_registro"], r["id"]))
@@ -800,11 +852,17 @@ PASTA_GERAL = "geral"  # fotos sem cômodo específico (ambiente vazio ou "Geral
 
 
 def _bytes_foto_para_zip(foto: Path) -> tuple[bytes, str]:
-    """(bytes, extensão) da foto para o ZIP, sempre que possível em JPEG limpo.
+    """Lê uma foto para o ZIP, garantindo JPEG sem metadados sempre que possível.
 
-    Fotos novas já são JPEG sem metadados e saem intactas. Fotos legadas (PNG ou JPEG com
-    EXIF/GPS) são regravadas como JPEG limpo. Se a imagem não puder ser lida, vai o arquivo
-    original com a extensão dele, para nenhuma foto sumir da exportação.
+    Fotos novas já são JPEG limpo e saem intactas. Fotos legadas (PNG ou JPEG com EXIF/GPS)
+    são regravadas por `security.strip_image_exif`.
+
+    Args:
+        foto: Arquivo em uploads.
+
+    Returns:
+        Tupla (bytes, extensão). Se a imagem não puder ser lida, devolve os bytes originais com
+        a extensão do arquivo, para nenhuma foto sumir da exportação.
     """
     dados = foto.read_bytes()
     try:
@@ -820,7 +878,23 @@ def _bytes_foto_para_zip(foto: Path) -> tuple[bytes, str]:
 
 
 def _caminho_zip(*partes: str) -> str:
-    """Junta segmentos já saneados; recusa o que não for slug (defesa extra contra path traversal)."""
+    """Monta um caminho interno do ZIP a partir de segmentos já saneados.
+
+    Args:
+        *partes: Segmentos (pastas e nome final); só o último pode ter extensão
+            (jpg, jpeg, png, txt ou html).
+
+    Returns:
+        Segmentos unidos por "/".
+
+    Raises:
+        ValueError: Algum segmento não é um slug válido.
+
+    Note:
+        Segurança: segunda barreira contra path traversal ("zip slip"), além de
+        `sanitize_slug`. Nenhuma entrada do ZIP pode conter "..", barras extras ou caminho
+        absoluto.
+    """
     for p in partes:
         base, _, ext = p.partition(".")
         if not security.SLUG_VALIDO.fullmatch(base) or ext not in ("", "jpg", "jpeg", "png", "txt", "html"):
@@ -829,11 +903,27 @@ def _caminho_zip(*partes: str) -> str:
 
 
 def _chave_arquivo(foto: Path) -> str:
-    """Identidade do arquivo físico (Windows: sem diferenciar maiúsculas nem / e \\)."""
+    """Identifica o arquivo físico de uma foto, para agrupar linhas que usam o mesmo arquivo.
+
+    Args:
+        foto: Caminho da foto.
+
+    Returns:
+        Caminho absoluto normalizado (no Windows, sem diferenciar maiúsculas nem / e barra
+        invertida).
+    """
     return os.path.normcase(str(foto.resolve()))
 
 
 def _sha256(dados: bytes) -> str:
+    """Calcula o hash de conteúdo usado na deduplicação do ZIP.
+
+    Args:
+        dados: Bytes da foto, exatamente como vão para o ZIP.
+
+    Returns:
+        SHA-256 em hexadecimal.
+    """
     return hashlib.sha256(dados).hexdigest()
 
 
@@ -843,31 +933,78 @@ def _unicos(valores) -> list:
 
 
 def _pasta_comodo(ambiente: str | None) -> str:
-    """Slug do cômodo; fotos sem cômodo (vazio/'Geral', inclusive registros antigos) vão para 'geral'."""
+    """Define a pasta do cômodo de uma foto dentro do ZIP.
+
+    Args:
+        ambiente: Ambiente gravado na foto.
+
+    Returns:
+        Slug do cômodo, ou "geral" para fotos sem cômodo específico (vazio ou "Geral",
+        inclusive registros antigos).
+    """
     if db.normalizar_busca(ambiente or "").strip() in ("", "geral"):
         return PASTA_GERAL
     return security.sanitize_slug(ambiente, padrao=PASTA_GERAL)
 
 
 def slug_obra(obra: dict) -> str:
+    """Gera o nome seguro da pasta raiz da obra no ZIP.
+
+    Args:
+        obra: Dados da obra (usa `nome_cliente`; sem nome aproveitável, "obra-{id}").
+
+    Returns:
+        Slug da obra.
+    """
     return security.sanitize_slug(obra.get("nome_cliente"), padrao=f"obra-{obra.get('id') or 'sem-id'}")
 
 
 def nome_arquivo_zip(obra: dict) -> str:
+    """Gera o nome do arquivo .zip oferecido para download.
+
+    Args:
+        obra: Dados da obra.
+
+    Returns:
+        "{slug-da-obra}_{AAAAMMDD}.zip", com a data de hoje.
+    """
     return f"{slug_obra(obra)}_{date.today():%Y%m%d}.zip"
 
 
 def gerar_zip_asbuilt(obra: dict, registros: list[dict], tarefas: list[dict], midias: list[dict]) -> bytes:
-    """ZIP em memória com as fotos organizadas por obra e cômodo, e o relatório na raiz.
+    """Gera em memória o ZIP As-Built da obra: fotos por cômodo e relatório na raiz.
 
-        {slug-da-obra}/relatorio_obra.html               relatório completo (abre no navegador)
-        {slug-da-obra}/memorial_descritivo_asbuilt.txt   resumo + índice das fotos
+    Estrutura::
+
+        {slug-da-obra}/relatorio_obra.html              relatório (abre no navegador)
+        {slug-da-obra}/memorial_descritivo_asbuilt.txt  resumo + índice das fotos
         {slug-da-obra}/{slug-do-comodo}/{data}_{slug-da-tarefa}_{seq}.jpg
-        {slug-da-obra}/geral/...                         fotos sem cômodo específico
+        {slug-da-obra}/geral/...                        fotos sem cômodo específico
 
-    Ex.: reforma-joao-silva/banheiro-social/2026-11-11_retirada-da-ceramica_01.jpg
-    Os nomes organizados existem só dentro do ZIP; no servidor e no banco as fotos seguem com
-    nome UUID, então nenhum registro existente é alterado.
+    Regras de negócio:
+        - deduplicação por conteúdo: cada foto é identificada por
+          `sha256(bytes gravados)`; o mesmo conteúdo é gravado uma única vez por pasta de
+          cômodo (set de (slug_comodo, sha256)), mesmo vindo de arquivos ou tarefas
+          diferentes. Em cômodos diferentes, uma cópia por pasta;
+        - foto de uma tarefa usa o slug da tarefa; foto de várias tarefas usa
+          "multiplas-tarefas". A sequência conta por data + tarefa no cômodo e nunca
+          sobrescreve;
+        - memorial e relatório referenciam o arquivo gravado em todas as tarefas da foto.
+
+    Args:
+        obra: Dados da obra.
+        registros: Registros diários (histórico do memorial).
+        tarefas: Tarefas do checklist.
+        midias: Linhas de `midias_obra`; fotos sem arquivo em disco são ignoradas.
+
+    Returns:
+        Bytes do arquivo ZIP.
+
+    Note:
+        Segurança: todos os segmentos passam por `sanitize_slug` e `_caminho_zip` (sem zip
+        slip), e as fotos saem sem EXIF/GPS (`_bytes_foto_para_zip`). Os nomes organizados
+        existem só no ZIP; no disco e no banco as fotos seguem com nome UUID, sem alterar
+        nenhum registro.
     """
     s = sanitize_text
     raiz = slug_obra(obra)

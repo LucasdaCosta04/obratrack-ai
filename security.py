@@ -52,9 +52,20 @@ class MidiaInvalidaError(ValueError):
 # Imagens: remoção de metadados
 # --------------------------------------------------------------------------- #
 def imagem_sem_metadados(img: Image.Image) -> Image.Image:
-    """Nova imagem RGB construída só com os pixels: nenhum EXIF, XMP, ICC ou outro metadado.
+    """Cria uma imagem RGB nova a partir apenas dos pixels, sem nenhum metadado.
 
-    A rotação indicada pelo EXIF é aplicada aos pixels antes, para a foto não ficar deitada.
+    A orientação do EXIF é aplicada aos pixels antes do descarte, para a foto não ficar deitada.
+    Transparência (RGBA, LA, P) é composta sobre fundo branco, já que o destino é JPEG.
+
+    Args:
+        img: Imagem já aberta pelo Pillow (qualquer modo).
+
+    Returns:
+        Imagem RGB nova, com `info` vazio.
+
+    Note:
+        Segurança: `Image.frombytes` gera um objeto novo, então nada do arquivo original
+        (EXIF com GPS, data/hora, modelo do aparelho, XMP, ICC, IPTC, comentários) é copiado.
     """
     img = ImageOps.exif_transpose(img)
     if img.mode in ("RGBA", "LA", "P"):
@@ -69,10 +80,19 @@ def imagem_sem_metadados(img: Image.Image) -> Image.Image:
 
 
 def _jpeg_ja_limpo(img: Image.Image, image_bytes: bytes, lado_maximo: int) -> bool:
-    """True se a imagem já é um JPEG RGB gerado por esta função: só o segmento APP0/JFIF,
-    nenhum EXIF/XMP/ICC/IPTC/comentário, nada depois do fim da imagem e dentro do tamanho.
+    """Diz se a imagem já é um JPEG limpo gerado por `strip_image_exif`.
 
-    Evita recomprimir (e perder nitidez) a foto que já foi tratada ao entrar no buffer da câmera.
+    Serve para não recomprimir (e perder nitidez) uma foto que já foi tratada, por exemplo
+    ao entrar no buffer da câmera e depois ser salva.
+
+    Args:
+        img: Imagem aberta a partir de `image_bytes`.
+        image_bytes: Bytes originais do arquivo.
+        lado_maximo: Lado máximo permitido, em pixels.
+
+    Returns:
+        True somente se for JPEG RGB com apenas o segmento APP0/JFIF, sem EXIF, XMP, ICC,
+        IPTC ou comentário, sem dados após o fim da imagem e dentro de `lado_maximo`.
     """
     if img.format != "JPEG" or img.mode != "RGB" or max(img.size) > lado_maximo:
         return False
@@ -84,14 +104,29 @@ def _jpeg_ja_limpo(img: Image.Image, image_bytes: bytes, lado_maximo: int) -> bo
 
 
 def strip_image_exif(image_bytes: bytes, lado_maximo: int = LADO_MAXIMO_FOTO) -> bytes:
-    """Regrava a imagem como JPEG limpo e nítido.
+    """Regrava a imagem como JPEG limpo, com orientação corrigida e tamanho limitado.
 
-    1) `ImageOps.exif_transpose`: aplica a orientação do celular (retrato/paisagem) aos pixels,
-       para a foto não ficar deitada ou de cabeça para baixo depois de perder o EXIF;
-    2) remove 100% dos metadados (GPS, data/hora, aparelho);
-    3) reduz com `Image.Resampling.LANCZOS` para caber em 2048 x 2048 (nunca amplia);
-    4) salva em JPEG qualidade 85, optimize.
-    Uma imagem que já saiu desta função é devolvida sem recompressão.
+    Etapas:
+        1. `ImageOps.exif_transpose` aplica a rotação do celular aos pixels;
+        2. remove 100% dos metadados (GPS, data/hora, aparelho), via `imagem_sem_metadados`;
+        3. reduz com `Image.Resampling.LANCZOS` para caber em `lado_maximo` (nunca amplia);
+        4. salva em JPEG qualidade 85 com `optimize`.
+    Uma imagem que já passou por esta função volta intacta (sem segunda compressão).
+
+    Args:
+        image_bytes: Conteúdo do arquivo enviado (JPEG ou PNG).
+        lado_maximo: Maior lado permitido, em pixels (padrão 2048).
+
+    Returns:
+        Bytes do JPEG limpo.
+
+    Raises:
+        MidiaInvalidaError: Arquivo corrompido, ilegível ou suspeito de "decompression bomb".
+            A mensagem é segura para exibir ao usuário.
+
+    Note:
+        Segurança: `DecompressionBombWarning` é promovido a erro, e a imagem é decodificada por
+        completo (`load`) antes de qualquer processamento, para recusar arquivos malformados.
     """
     try:
         with warnings.catch_warnings():
@@ -137,12 +172,26 @@ def _tipo_imagem(cabecalho: bytes) -> str | None:
 
 
 def validate_and_save_media(file_bytes: bytes, media_type: str) -> Path:
-    """Valida e salva uma mídia em uploads\\<uuid4>.<ext>.
+    """Valida uma mídia enviada e a grava na pasta uploads com nome aleatório.
 
-    `media_type` é "audio" (WAV, MP3 ou OGG) ou "image" (JPEG ou PNG). O tipo é decidido
-    pelo conteúdo real do arquivo, nunca pelo nome ou extensão enviados. Fotos são salvas
-    sempre como JPEG sem metadados, orientação corrigida e no máximo 2048 px de lado (LANCZOS, q85). Retorna o caminho relativo à pasta do projeto,
-    no formato gravado no banco (ex.: uploads\\3f2a...e1.jpg).
+    Args:
+        file_bytes: Conteúdo bruto do arquivo enviado.
+        media_type: "audio" (WAV, MP3 ou OGG) ou "image" (JPEG ou PNG).
+
+    Returns:
+        Caminho relativo à pasta do projeto, no formato gravado no banco
+        (ex.: uploads/3f2a...e1.jpg, com o separador do sistema).
+
+    Raises:
+        ValueError: `media_type` diferente de "audio" ou "image" (erro de programação).
+        MidiaInvalidaError: Arquivo vazio, maior que 15 MB ou de formato não reconhecido.
+
+    Note:
+        Segurança:
+        - o tipo é decidido pelos bytes iniciais (assinatura), nunca pelo nome/extensão enviados;
+        - fotos são sempre regravadas por `strip_image_exif` (sem GPS/EXIF, máx. 2048 px, JPEG);
+        - o nome é um UUID4 (o nome original nunca chega ao disco) e o arquivo é aberto em modo
+          "xb", que falha em vez de sobrescrever um arquivo existente.
     """
     if media_type not in ("audio", "image"):
         raise ValueError(f"media_type inválido: {media_type!r}")
@@ -176,10 +225,21 @@ def validate_and_save_media(file_bytes: bytes, media_type: str) -> Path:
 # Textos
 # --------------------------------------------------------------------------- #
 def sanitize_text(text: object, max_length: int = LIMITE_TEXTO_PADRAO, escape_html: bool = False) -> str:
-    """strip, remoção de caracteres de controle e limite de tamanho.
+    """Limpa um texto livre antes de gravar no banco ou exibir.
 
-    Com `escape_html=True` (texto que vai para HTML customizado) aplica `html.escape`
-    depois de cortar, para não deixar entidades HTML pela metade.
+    Remove espaços nas pontas e caracteres de controle (inclusive NUL), que podem corromper
+    logs e HTML, e corta no tamanho máximo.
+
+    Args:
+        text: Valor a limpar (None vira string vazia; não-strings são convertidas com `str`).
+        max_length: Tamanho máximo do resultado, em caracteres.
+        escape_html: Se True, aplica `html.escape` para uso em HTML customizado.
+
+    Returns:
+        Texto limpo.
+
+    Note:
+        O escape é aplicado depois do corte, para nunca deixar uma entidade HTML pela metade.
     """
     texto = _CONTROLE.sub("", str(text or "")).strip()
     if len(texto) > max_length:
@@ -197,13 +257,26 @@ SLUG_VALIDO = re.compile(r"[a-z0-9]+(?:[-_][a-z0-9]+)*")
 def sanitize_slug(texto: object, padrao: str = "geral", max_length: int = 60, sep: str = "-") -> str:
     """Converte qualquer texto em um único segmento seguro de caminho (pasta ou arquivo).
 
-    'Banheiro Social (Suíte)' -> 'banheiro-social-suite'; 'Ação/Reforma' -> 'acao-reforma'.
-    - remove acentos (NFKD) e caracteres de controle, e passa para minúsculas;
-    - qualquer sequência fora de [a-z0-9] vira um único `sep` (espaços, pontuação, emoji);
-    - path traversal é impossível: '.', '/', '\' e ':' nunca sobrevivem, então '../../etc'
-      vira 'etc' e '..' vira `padrao`;
-    - evita nomes reservados do Windows (CON, NUL, COM1...) e limita o tamanho.
-    O resultado sempre casa com SLUG_VALIDO; texto vazio devolve `padrao` (também saneado).
+    Exemplos: 'Banheiro Social (Suíte)' -> 'banheiro-social-suite';
+    'Ação/Reforma' -> 'acao-reforma'; '../../etc' -> 'etc'; '..' -> `padrao`.
+
+    Args:
+        texto: Texto de origem (nome da obra, cômodo, tarefa, data...). None vira vazio.
+        padrao: Valor usado quando nada aproveitável sobra (também é saneado; em último
+            caso, 'item').
+        max_length: Tamanho máximo do slug.
+        sep: Separador entre palavras: '-' ou '_'.
+
+    Returns:
+        Slug em minúsculas, sem acentos, que sempre casa com `SLUG_VALIDO`.
+
+    Raises:
+        ValueError: `sep` diferente de '-' ou '_'.
+
+    Note:
+        Segurança: qualquer caractere fora de [a-z0-9] vira separador, então '.', '/', barra
+        invertida e ':' nunca sobrevivem; path traversal e caminhos absolutos são impossíveis.
+        Nomes reservados do Windows (CON, NUL, COM1...) recebem o sufixo '-x'.
     """
     if sep not in ("-", "_"):
         raise ValueError(f"sep inválido: {sep!r}")
@@ -287,9 +360,19 @@ def _limpar_falhas(origem: str) -> None:
 def check_auth() -> bool:
     """Exige o PIN de acesso, se configurado no servidor, antes de exibir qualquer dado.
 
-    Sem PIN configurado, libera o acesso. Com PIN, mostra a tela de acesso e interrompe
-    o script (st.stop) até a sessão ser autenticada. Após 5 erros a origem fica
-    bloqueada por 5 minutos, mesmo recarregando a página.
+    Sem PIN configurado, libera o acesso. Com PIN, mostra a tela de acesso e interrompe o script
+    (`st.stop`) até a sessão ser autenticada.
+
+    Returns:
+        True quando a sessão pode ver os dados. Sem autenticação a função não retorna:
+        `st.stop()` encerra a execução da página.
+
+    Note:
+        Segurança:
+        - comparação em tempo constante (`hmac.compare_digest`), contra ataque de tempo;
+        - após 5 erros, a origem do cliente fica bloqueada por 5 minutos. O contador é
+          compartilhado pelo servidor, então recarregar a página ou abrir outra aba não zera;
+        - o PIN vem só do ambiente do servidor, nunca do navegador.
     """
     pin = _pin_configurado()
     if not pin or st.session_state.get("authenticated"):

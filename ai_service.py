@@ -217,7 +217,15 @@ class AnaliseDiarioObra(BaseModel):
 # Configuração do servidor (nunca exposta à interface)
 # --------------------------------------------------------------------------- #
 def _obter_api_key() -> str:
-    """Lê a chave estritamente do ambiente do servidor (env var tem prioridade sobre o .env)."""
+    """Lê a chave do Gemini apenas do ambiente do servidor.
+
+    Returns:
+        A chave, ou "" se ausente ou igual ao placeholder do .env.example.
+
+    Note:
+        Segurança: a variável de ambiente tem prioridade sobre o .env, e a chave nunca é
+        pedida ao usuário nem enviada ao navegador.
+    """
     load_dotenv(ENV_PATH)
     chave = (os.environ.get("GEMINI_API_KEY") or "").strip()
     return "" if chave == PLACEHOLDER_CHAVE else chave
@@ -270,6 +278,19 @@ Regras obrigatórias:
 
 def _montar_prompt(contexto_obra: str, observacoes_texto: str, tem_audio: bool, qtd_fotos: int,
                    transcricao_literal: str = "") -> str:
+    """Monta o texto final do pedido ao Gemini, enviado depois do áudio e das imagens.
+
+    Args:
+        contexto_obra: Cliente, endereço, escopo e status da obra.
+        observacoes_texto: Observações digitadas no dia.
+        tem_audio: Se há áudio no pedido.
+        qtd_fotos: Quantidade de imagens enviadas. Elas são nomeadas "Imagem 0" a
+            "Imagem N-1", na mesma ordem usada em `foto_indices`.
+        transcricao_literal: Transcrição pt-BR já obtida; vira a base da `transcricao_audio`.
+
+    Returns:
+        Prompt em português com o contexto, as fontes recebidas e o lembrete do vínculo visual.
+    """
     fontes = []
     if tem_audio:
         fontes.append("um ÁUDIO com o relato do trabalhador (fonte principal)")
@@ -294,7 +315,23 @@ def _montar_prompt(contexto_obra: str, observacoes_texto: str, tem_audio: bool, 
 
 
 def _parte_audio(client: genai.Client, caminho_audio: Path) -> tuple[types.Part | types.File, Optional[types.File]]:
-    """Retorna a parte de áudio para o `contents` e, se houve upload, o arquivo remoto."""
+    """Prepara o áudio para o `contents` do Gemini.
+
+    Até `LIMITE_AUDIO_INLINE_BYTES` o áudio vai inline; acima disso vai pela Files API, com
+    espera de até 120 s pelo processamento remoto.
+
+    Args:
+        client: Cliente `genai` já autenticado.
+        caminho_audio: Arquivo de áudio local.
+
+    Returns:
+        Tupla (parte para o `contents`, arquivo remoto ou None). O arquivo remoto deve ser
+        apagado pelo chamador ao final (ver `processar_registro_obra`).
+
+    Raises:
+        TimeoutError: O processamento remoto passou de 120 s.
+        RuntimeError: A Files API marcou o arquivo como FAILED.
+    """
     mime = MIME_AUDIO.get(caminho_audio.suffix.lower(), "audio/wav")
     audio_bytes = caminho_audio.read_bytes()
 
@@ -315,13 +352,32 @@ def _parte_audio(client: genai.Client, caminho_audio: Path) -> tuple[types.Part 
 
 
 def _carregar_foto(caminho_foto: Path) -> Image.Image:
-    """Abre a foto corrigindo a rotação EXIF (comum em fotos de celular)."""
+    """Abre uma foto para envio ao Gemini, com a rotação do EXIF aplicada.
+
+    Args:
+        caminho_foto: Arquivo de imagem local.
+
+    Returns:
+        Imagem RGB decodificada.
+    """
     with Image.open(caminho_foto) as img:
         img.load()
         return ImageOps.exif_transpose(img).convert("RGB")
 
 
 def _interpretar_resposta(response: types.GenerateContentResponse) -> AnaliseDiarioObra:
+    """Converte a resposta do Gemini no schema `AnaliseDiarioObra`.
+
+    Args:
+        response: Resposta de `generate_content` com `response_schema` configurado.
+
+    Returns:
+        A análise validada pelo Pydantic.
+
+    Raises:
+        ValueError: Resposta vazia (ex.: bloqueio de segurança do modelo).
+        pydantic.ValidationError: JSON fora do schema.
+    """
     if isinstance(response.parsed, AnaliseDiarioObra):
         return response.parsed
     if not response.text:
@@ -330,10 +386,22 @@ def _interpretar_resposta(response: types.GenerateContentResponse) -> AnaliseDia
 
 
 def _gerar_com_fallback(client: genai.Client, contents: list) -> AnaliseDiarioObra:
-    """Percorre a cadeia de modelos com retry em erros transitórios (503 etc.).
+    """Chama a cadeia de modelos do Gemini até obter uma análise válida.
 
-    Erros de chave são propagados (não adianta trocar de modelo). Levanta RuntimeError
-    somente se TODOS os modelos falharem.
+    Regras: 429/503 repetem o mesmo modelo (`TENTATIVAS_POR_MODELO`, com pausa de
+    `ESPERA_RETRY_SEGUNDOS`); 404, 500, 504, timeout e rede passam direto ao próximo modelo;
+    resposta fora do schema conta como tentativa falha.
+
+    Args:
+        client: Cliente `genai` com o retry interno do SDK desligado.
+        contents: Áudio, imagens rotuladas ("Imagem 0:", ...) e prompt.
+
+    Returns:
+        A análise do primeiro modelo que responder corretamente, com `_modelo` preenchido.
+
+    Raises:
+        errors.APIError: Chave inválida/sem permissão (trocar de modelo não resolve).
+        RuntimeError: Todos os modelos falharam; a mensagem lista cada falha.
     """
     config = types.GenerateContentConfig(
         system_instruction=INSTRUCAO_SISTEMA,
@@ -434,12 +502,21 @@ def _trechos_de_fala(audio) -> list:
 
 
 def transcrever_audio_garantido(caminho_audio: Optional[str | Path]) -> str:
-    """Transcrição literal, em português, de TUDO o que foi falado no áudio (inclusive > 1 min).
+    """Transcreve, em português, tudo o que foi falado no áudio (inclusive mais de 1 min).
 
-    Converte para WAV PCM 16 kHz mono, divide em trechos de até 35 s (cortando em silêncios)
-    e transcreve cada um com `recognize_google(..., language="pt-BR")`, juntando o texto.
-    Trechos inaudíveis são pulados. Retorna "" se não houver fala reconhecível ou se o
-    serviço estiver fora do ar — nunca levanta exceção (o registro sempre pode ser salvo).
+    Converte para WAV PCM 16 kHz mono, divide em trechos de até 35 s cortando nos silêncios e
+    transcreve cada um com `recognize_google(..., language="pt-BR")`. Trechos inaudíveis são
+    pulados.
+
+    Args:
+        caminho_audio: Arquivo de áudio (WAV, MP3, OGG, WEBM...) ou None.
+
+    Returns:
+        Texto reconhecido, ou "" se não houver fala, áudio ou serviço disponível.
+
+    Note:
+        Regra de negócio: nunca levanta exceção. A transcrição independe da IA, e o registro
+        do dia sempre pode ser salvo.
     """
     if not caminho_audio:
         return ""
@@ -636,12 +713,24 @@ def gerar_analise_offline(
     caminho_foto: Optional[Path | list[Path]] = None,
     transcricao: str = "",
 ) -> AnaliseDiarioObra:
-    """Gera uma análise estruturada por regras locais, sem chamar a IA.
+    """Gera a análise do dia por regras locais, sem chamar a IA.
 
-    `transcricao` (texto real falado no áudio) e as observações escritas formam o relato do
-    dia: dele saem o resumo, os detalhes/imprevistos, o atraso e as tarefas por ambiente.
-    `caminho_foto` aceita uma foto ou uma lista de fotos. As fotos não são classificadas
-    aqui (fotos_classificadas fica vazia); quem salva usa as tarefas para vinculá-las.
+    A transcrição e as observações formam o relato, de onde saem o resumo, os
+    detalhes/imprevistos, o atraso e as tarefas separadas por ambiente.
+
+    Args:
+        observacoes_texto: Observações digitadas no dia.
+        contexto_obra: Contexto da obra (escopo ajuda a deduzir o cômodo).
+        tem_audio: Se havia áudio no registro.
+        caminho_foto: Uma foto, uma lista de fotos ou None.
+        transcricao: Texto real falado no áudio, se disponível.
+
+    Returns:
+        `AnaliseDiarioObra` marcada como offline (`modo_offline` True, com `aviso`).
+
+    Note:
+        Sem visão computacional, as fotos não são classificadas e nenhuma tarefa recebe
+        `foto_indices`; quem salva decide o vínculo (ver `vincular_fotos_do_registro`).
     """
     fotos = _lista_fotos(caminho_foto)
     transcricao = (transcricao or "").strip()
@@ -714,8 +803,23 @@ def gerar_analise_offline(
 # Função principal
 # --------------------------------------------------------------------------- #
 def _corrigir_ambientes(analise: AnaliseDiarioObra, relato: str, contexto_obra: str, qtd_fotos: int) -> AnaliseDiarioObra:
-    """Aplica as regras de palavras-chave sobre a saída da IA (ex.: cerâmica do banheiro
-    classificada como 'Área Externa' volta para 'Banheiro') e descarta fotos inexistentes."""
+    """Aplica as regras locais sobre a saída da IA e descarta índices inválidos.
+
+    - Ambiente: palavras-chave prevalecem (ex.: cerâmica do banheiro classificada como
+      'Área Externa' volta para 'Banheiro').
+    - `foto_indices`: mantém só índices existentes (0 a `qtd_fotos` - 1), sem repetição e
+      ordenados.
+    - `fotos_classificadas`: mantém uma entrada por índice existente.
+
+    Args:
+        analise: Análise devolvida pelo modelo (alterada no lugar).
+        relato: Transcrição + observações do dia.
+        contexto_obra: Contexto/escopo da obra.
+        qtd_fotos: Quantidade de imagens realmente enviadas.
+
+    Returns:
+        A mesma `analise`, corrigida.
+    """
     for t in analise.tarefas_extraidas:
         t.ambiente = corrigir_ambiente(t.ambiente, t.descricao, relato, contexto_obra)
         # Só índices existentes (0..N-1), sem repetição, em ordem.
@@ -739,11 +843,35 @@ def processar_registro_obra(
     modo_offline: Optional[bool] = None,
     transcricao_pronta: Optional[str] = None,
 ) -> AnaliseDiarioObra:
-    """Analisa áudio + foto + observações de um dia de obra e devolve a análise validada.
+    """Analisa áudio, fotos e observações de um dia de obra (IA multimodal).
 
-    Tenta todos os modelos da cadeia (com retry em 503); só usa a análise offline se
-    toda a cadeia falhar, se não houver chave no servidor ou se `modo_offline` for True.
-    Nunca levanta exceção por indisponibilidade da IA — o registro sempre pode ser salvo.
+    Fluxo:
+        1. transcrição pt-BR dedicada do áudio (sempre, mesmo sem IA);
+        2. envio ao Gemini do áudio e de cada foto precedida do rótulo "Imagem i:" (base 0);
+        3. o modelo devolve as tarefas por ambiente, cada uma com `foto_indices`: só as
+           imagens que mostram visualmente aquela tarefa;
+        4. `_corrigir_ambientes` valida ambientes e índices.
+
+    Args:
+        caminho_audio: Áudio do relato ou None.
+        caminho_foto: Uma foto, uma lista de fotos ou None. A ordem define os índices.
+        observacoes_texto: Observações digitadas.
+        contexto_obra: Contexto da obra para o modelo.
+        modo_offline: True força a análise local; None usa a configuração do servidor.
+        transcricao_pronta: Transcrição já feita (reprocessamento), para não transcrever de novo.
+
+    Returns:
+        `AnaliseDiarioObra` validada. Se a IA estiver indisponível, sem chave ou falhar em
+        todos os modelos, devolve a análise offline, com `modo_offline` True.
+
+    Raises:
+        FileNotFoundError: Algum arquivo de áudio/foto informado não existe.
+        ValueError: Nenhum áudio, foto ou observação foi enviado.
+
+    Note:
+        Regra de negócio: indisponibilidade da IA nunca impede salvar o registro.
+        Segurança: a chave vem só do servidor, e o áudio enviado pela Files API é apagado
+        ao final (best-effort; arquivos remotos expiram em 48 h).
     """
     audio_path = Path(caminho_audio) if caminho_audio else None
     fotos = _lista_fotos(caminho_foto)

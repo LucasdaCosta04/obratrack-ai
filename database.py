@@ -50,7 +50,22 @@ def _em_unidade_de_rede(caminho: Path) -> bool:
 
 
 def validar_caminho_local(caminho: Path, raiz: Path = BASE_DIR) -> Path:
-    """Garante que `caminho` (após resolver symlinks e '..') fica dentro de `raiz`, em disco local."""
+    """Garante que um caminho fica dentro de `raiz` e em disco local.
+
+    Args:
+        caminho: Caminho a validar (symlinks e '..' são resolvidos antes).
+        raiz: Diretório permitido (padrão: pasta do projeto).
+
+    Returns:
+        O caminho absoluto resolvido.
+
+    Raises:
+        CaminhoInseguroError: Caminho fora de `raiz` ou em compartilhamento/unidade de rede.
+
+    Note:
+        Segurança: impede que banco e mídias saiam da pasta do projeto (path traversal) ou
+        fiquem em rede, onde o SQLite em WAL não é confiável e o acesso não é restrito.
+    """
     resolvido = Path(caminho).resolve()
     raiz_resolvida = raiz.resolve()
     if not resolvido.is_relative_to(raiz_resolvida):
@@ -61,7 +76,18 @@ def validar_caminho_local(caminho: Path, raiz: Path = BASE_DIR) -> Path:
 
 
 def caminho_midia_seguro(caminho: str | Path | None) -> Optional[Path]:
-    """Resolve um caminho de mídia salvo no banco e só o aceita se estiver dentro de uploads\\."""
+    """Resolve um caminho de mídia vindo do banco, aceitando só a pasta uploads.
+
+    Args:
+        caminho: Caminho salvo no banco (relativo ao projeto ou absoluto) ou None.
+
+    Returns:
+        Caminho absoluto dentro de uploads, ou None se vazio ou inseguro.
+
+    Note:
+        Segurança: um registro adulterado no banco nunca faz o app ler ou apagar arquivos
+        fora de uploads.
+    """
     if not caminho:
         return None
     p = Path(caminho)
@@ -176,12 +202,21 @@ def _mesmo_ambiente(a: str, b: str) -> bool:
 
 
 def detectar_ambiente(texto: object, contexto: object = "", padrao: str = "Geral") -> str:
-    """Ambiente de uma atividade a partir do texto e, se preciso, do escopo da obra.
+    """Deduz o ambiente (cômodo) de uma atividade pelo texto e, se preciso, pelo escopo.
 
-    1) cômodo citado no próprio texto ("cerâmica do banheiro" -> Banheiro);
-    2) serviço interno sem cômodo (cerâmica, piso, cano...) -> cômodo do contexto/escopo;
-    3) hidráulica/elétrica sem cômodo -> "Hidráulica Geral" / "Elétrica Geral";
-    4) caso contrário, `padrao`.
+    Ordem de decisão:
+        1. cômodo citado no próprio texto ("cerâmica do banheiro" -> Banheiro);
+        2. serviço interno sem cômodo (cerâmica, piso, cano...) -> cômodo do contexto/escopo;
+        3. hidráulica/elétrica sem cômodo -> "Hidráulica Geral" / "Elétrica Geral";
+        4. caso contrário, `padrao`.
+
+    Args:
+        texto: Descrição da atividade ou relato.
+        contexto: Escopo/contexto da obra.
+        padrao: Ambiente usado quando nada é identificado.
+
+    Returns:
+        Nome padronizado do ambiente.
     """
     citados = ambientes_citados(texto)
     if citados:
@@ -199,13 +234,23 @@ def detectar_ambiente(texto: object, contexto: object = "", padrao: str = "Geral
 
 
 def corrigir_ambiente(ambiente: Optional[str], descricao: object, relato: object = "", contexto: object = "") -> str:
-    """Corrige o ambiente sugerido (pela IA ou por regra) com base nas palavras-chave.
+    """Corrige o ambiente sugerido (pela IA ou por regra) usando palavras-chave.
 
-    - Se a descrição da atividade cita um cômodo, ele prevalece ("Retirada da cerâmica do
-      banheiro" nunca fica em "Área Externa").
-    - Se o ambiente é genérico (Geral, Área Externa, Hidráulica Geral...) e a atividade é um
-      serviço interno (cerâmica, piso, cano...), usa o cômodo citado no relato do dia ou,
-      sem cômodo no relato, o do escopo da obra.
+    Regras:
+        - se a descrição cita um cômodo, ele prevalece ("Retirada da cerâmica do banheiro"
+          nunca fica em "Área Externa");
+        - se o ambiente é genérico (Geral, Área Externa, Hidráulica Geral...) e o serviço é
+          interno (cerâmica, piso, cano...), usa o cômodo citado no relato do dia ou, sem
+          cômodo no relato, o do escopo da obra.
+
+    Args:
+        ambiente: Ambiente sugerido (pode ser vazio).
+        descricao: Descrição da tarefa ou foto.
+        relato: Relato completo do dia.
+        contexto: Escopo/contexto da obra.
+
+    Returns:
+        Ambiente corrigido.
     """
     ambiente = (ambiente or "").strip()
     desc = normalizar_busca(descricao)
@@ -229,10 +274,24 @@ def corrigir_ambiente(ambiente: Optional[str], descricao: object, relato: object
 
 @contextmanager
 def get_connection(db_path: Path = DB_PATH) -> Iterator[sqlite3.Connection]:
-    """Abre uma conexão com FK e WAL habilitados, commit automático e fechamento garantido.
+    """Abre uma conexão SQLite configurada, com commit ou rollback automáticos.
 
-    WAL (write-ahead log) mantém o banco íntegro se o processo cair no meio de uma
-    gravação e permite leituras enquanto outra sessão grava.
+    Habilita chaves estrangeiras, WAL e a função SQL `norm()` (comparação sem acentos e sem
+    diferenciar maiúsculas). Faz commit ao sair sem erro, rollback em qualquer exceção, e
+    sempre fecha.
+
+    Args:
+        db_path: Arquivo do banco (validado por `validar_caminho_local`).
+
+    Yields:
+        Conexão com `row_factory = sqlite3.Row`.
+
+    Raises:
+        CaminhoInseguroError: Banco fora da pasta do projeto ou em unidade de rede.
+
+    Note:
+        WAL mantém o banco íntegro se o processo cair no meio de uma gravação e permite
+        leituras enquanto outra sessão grava.
     """
     conn = sqlite3.connect(str(validar_caminho_local(db_path)), timeout=10)
     conn.row_factory = sqlite3.Row
@@ -251,7 +310,15 @@ def get_connection(db_path: Path = DB_PATH) -> Iterator[sqlite3.Connection]:
 
 
 def init_db() -> None:
-    """Valida o ambiente local, cria as tabelas (se não existirem) e a pasta de uploads."""
+    """Prepara o ambiente local e o esquema do banco; seguro para chamar a cada início.
+
+    Valida os caminhos do banco e de uploads, avisa se o .gitignore não protege banco, chave e
+    fotos, cria a pasta uploads com permissão restrita, cria as tabelas que faltam e roda as
+    migrações idempotentes.
+
+    Raises:
+        CaminhoInseguroError: Banco ou uploads fora da pasta do projeto ou em rede.
+    """
     validar_caminho_local(DB_PATH)
     validar_caminho_local(UPLOADS_DIR)
     faltando = verificar_gitignore()
@@ -343,7 +410,19 @@ def init_db() -> None:
 
 
 def _migrar(conn: sqlite3.Connection) -> None:
-    """Migrações idempotentes para bancos criados por versões anteriores."""
+    """Atualiza bancos criados por versões anteriores, sem perder dados.
+
+    Só adiciona colunas que faltam (`ALTER TABLE ... ADD COLUMN`, valores antigos ficam NULL),
+    copia fotos antigas para `midias_obra` e liga fotos soltas legadas às tarefas.
+    Pode rodar várias vezes sem efeito colateral.
+
+    Args:
+        conn: Conexão aberta (dentro da transação de `init_db`).
+
+    Note:
+        Compatibilidade: `midias_obra.vinculo_ia` NULL identifica fotos antigas/manuais, que
+        mantêm as regras de vínculo por ambiente de antes.
+    """
     colunas = {row["name"] for row in conn.execute("PRAGMA table_info(registros_diarios)")}
     if "caminho_audio" not in colunas:
         conn.execute("ALTER TABLE registros_diarios ADD COLUMN caminho_audio TEXT")
@@ -487,10 +566,21 @@ def _validar_status(status: str) -> None:
 
 
 def _remover_midias_orfas(conn: sqlite3.Connection, caminhos: list[Optional[str]]) -> int:
-    """Apaga do disco as mídias que nenhum registro referencia mais.
+    """Apaga do disco as mídias que nenhum registro ou foto da galeria referencia mais.
 
-    Só remove arquivos dentro de uploads\\ (caminho_midia_seguro). Deve ser chamada
-    depois do DELETE, na mesma conexão, para enxergar o estado já atualizado.
+    Deve ser chamada depois do DELETE, na mesma conexão, para enxergar o estado já atualizado.
+
+    Args:
+        conn: Conexão da transação de exclusão.
+        caminhos: Caminhos (como gravados no banco) candidatos à remoção.
+
+    Returns:
+        Quantidade de arquivos apagados.
+
+    Note:
+        Segurança: só apaga arquivos dentro de uploads (`caminho_midia_seguro`). Um arquivo
+        compartilhado por várias linhas só sai quando a última referência some. Arquivo em uso
+        é ignorado e fica para uma limpeza futura.
     """
     removidos = 0
     for caminho in {c for c in caminhos if c}:
@@ -589,7 +679,17 @@ def editar_obra(
 
 
 def excluir_obra(obra_id: int) -> bool:
-    """Exclui a obra com todos os seus registros, tarefas e mídias. Retorna False se não existir."""
+    """Exclui a obra com todos os registros, tarefas e fotos, e apaga as mídias órfãs.
+
+    A exclusão é explícita em cada tabela (não depende de ON DELETE CASCADE, ausente em bancos
+    antigos).
+
+    Args:
+        obra_id: Id da obra.
+
+    Returns:
+        True se a obra existia e foi excluída; False caso contrário.
+    """
     with get_connection() as conn:
         midias = [
             c
@@ -784,9 +884,24 @@ def atualizar_transcricao_registro(registro_id: int, transcricao_audio: str) -> 
 
 
 def _vincular_fotos_soltas(conn: sqlite3.Connection, registro_id: int) -> int:
-    """Liga as fotos do registro sem tarefa à tarefa certa (mesmo ambiente) ou, se a foto
-    está em "Geral", à tarefa principal do registro (concluída primeiro), levando o ambiente.
-    Fotos sem tarefa em outro ambiente específico ficam como estão. Retorna quantas mudaram."""
+    """Liga as fotos soltas (sem tarefa) de um registro às tarefas desse registro.
+
+    Regras: a foto vai para a tarefa do mesmo ambiente; se a foto está em "Geral", vai para a
+    tarefa principal (concluídas primeiro) e herda o ambiente dela. Foto solta em outro
+    ambiente específico fica como está.
+
+    Args:
+        conn: Conexão aberta.
+        registro_id: Registro cujas fotos soltas serão avaliadas.
+
+    Returns:
+        Quantidade de fotos alteradas.
+
+    Note:
+        Regra de negócio: fotos com `vinculo_ia = 1` nunca são religadas. A IA já viu a imagem
+        e decidiu que ela não mostra nenhuma tarefa, então forçar o vínculo por cômodo a
+        colocaria em tarefas erradas.
+    """
     tarefas = conn.execute(
         "SELECT id, ambiente, descricao FROM tarefas_obra WHERE registro_id = ? ORDER BY concluida DESC, id",
         (registro_id,),
@@ -832,10 +947,26 @@ def aplicar_reprocessamento_registro(
 ) -> dict:
     """Grava a nova análise de um registro já salvo (ex.: áudio transcrito de novo).
 
-    Atualiza os textos do dia e faz "upsert" das tarefas por ambiente: a tarefa do registro
-    no mesmo ambiente é atualizada (título, resumo e detalhes; o status marcado à mão é
-    mantido); ambientes novos viram tarefas novas. Tarefas antigas sem correspondente ficam.
-    Por fim, liga as fotos soltas do registro às tarefas. Retorna contagens.
+    Atualiza os textos do dia e faz "upsert" das tarefas por ambiente: a tarefa do mesmo
+    ambiente é atualizada (título, resumo e detalhes; o status marcado à mão é mantido),
+    ambientes novos viram tarefas novas, e tarefas antigas sem correspondente ficam. Por fim,
+    liga as fotos soltas do registro (`_vincular_fotos_soltas`).
+
+    Args:
+        registro_id: Registro a atualizar.
+        transcricao_audio: Nova transcrição.
+        resumo_executivo: Novo resumo do dia.
+        detalhes_execucao_imprevistos: Novos detalhes/imprevistos.
+        motivo_atraso: Nova justificativa de atraso (ou o texto padrão sem atraso).
+        tarefas: Dicts com ambiente, descricao, resumo_servico, detalhes_servico e concluida.
+        mapeamento_asbuilt: Novo As-Built; só substitui o atual se este estiver vazio ou for
+            o texto padrão "sem foto".
+
+    Returns:
+        Dict com as contagens "criadas", "atualizadas" e "fotos_vinculadas".
+
+    Raises:
+        ValueError: O registro não existe.
     """
     with get_connection() as conn:
         reg = conn.execute("SELECT obra_id, mapeamento_asbuilt FROM registros_diarios WHERE id = ?",
@@ -884,11 +1015,21 @@ def aplicar_reprocessamento_registro(
 
 
 def excluir_registro_diario(registro_id: int, excluir_tarefas: bool = False, excluir_fotos: bool = False) -> bool:
-    """Exclui um registro diário e apaga com segurança suas mídias órfãs em uploads\\.
+    """Exclui um registro diário e apaga com segurança as mídias que ficarem órfãs.
 
-    Tarefas e fotos da galeria vindas desse registro são excluídas (`excluir_tarefas` /
-    `excluir_fotos`) ou mantidas na obra, desvinculadas (padrão). O áudio é sempre apagado.
-    Retorna False se o registro não existir.
+    Args:
+        registro_id: Registro a excluir.
+        excluir_tarefas: True exclui as tarefas vindas do registro; False (padrão) as mantém
+            na obra, desvinculadas.
+        excluir_fotos: True exclui as fotos da galeria vindas do registro; False (padrão) as
+            mantém, desvinculadas.
+
+    Returns:
+        True se o registro existia e foi excluído; False caso contrário.
+
+    Note:
+        O áudio do registro é sempre apagado. Arquivos só saem do disco quando nenhuma outra
+        linha os referencia (`_remover_midias_orfas`).
     """
     with get_connection() as conn:
         row = conn.execute(
@@ -1035,9 +1176,21 @@ _COLUNAS_DOSSIE_MIDIA = (
 
 
 def _cond_midia_da_tarefa(m: str) -> str:
-    """Fotos que documentam a tarefa `b`: vinculadas a ela ou, se soltas (sem tarefa), do
-    mesmo ambiente e do mesmo registro/dia. Fotos de OUTRA tarefa nunca entram, nem fotos soltas
-    que a IA já analisou e não ligou a nenhuma tarefa (vinculo_ia = 1: ficam só no registro do cômodo)."""
+    """Gera a condição SQL "esta foto documenta a tarefa `b`" (usada no dossiê).
+
+    Entram as fotos vinculadas à tarefa e, só para fotos legadas/manuais soltas
+    (`vinculo_ia` NULL), as do mesmo ambiente e do mesmo registro ou dia.
+
+    Args:
+        m: Alias SQL da tabela `midias_obra` na consulta.
+
+    Returns:
+        Trecho SQL para um JOIN/EXISTS contra a CTE `b` (tarefas).
+
+    Note:
+        Regra de negócio: fotos de outra tarefa nunca entram, nem fotos soltas que a IA analisou
+        e não ligou a nenhuma tarefa (`vinculo_ia = 1`); essas ficam só no registro do cômodo.
+    """
     return (
         f"{m}.obra_id = b.obra_id AND ({m}.tarefa_id = b.id OR ({m}.tarefa_id IS NULL AND {m}.vinculo_ia IS NULL "
         f"AND {m}.ambiente = b.ambiente AND ({m}.registro_id = b.reg_id OR {m}.data_midia = b.data_tarefa)))"
@@ -1055,21 +1208,33 @@ def buscar_dossie_tarefas(
     texto_sem_atraso: str = "",
     priorizar_diretos: bool = True,
 ) -> list[dict]:
-    """Dossiê completo de cada tarefa: a tarefa, o registro diário do dia e as fotos do serviço.
+    """Monta o dossiê de cada tarefa: a tarefa, o registro do dia e as fotos do serviço.
 
     - Registro: o de origem (`registro_id`) ou, para tarefas digitadas à mão, o registro da
-      mesma obra na data de criação da tarefa (LEFT JOIN: pode não haver).
-    - Fotos (LEFT JOIN): as vinculadas à tarefa e as soltas do mesmo ambiente e registro/dia.
-    - `termo_busca`: cada palavra precisa aparecer na tarefa, no relato/resumo/detalhes/atraso
-      do dia ou no título/descrição de alguma foto do dossiê (sem acentos/maiúsculas). Com
-      `priorizar_diretos`, se alguma tarefa corresponde pelo próprio texto/fotos, as que só
-      batem pelo relato do dia ficam de fora.
-    - `ambiente_filtro`: "Todos", um ambiente ou uma lista; `status_filtro`: "Todos"/"Todas",
-      "Pendentes" ou "Concluídas".
+      mesma obra na data de criação da tarefa (pode não haver).
+    - Fotos: as que satisfazem `_cond_midia_da_tarefa`.
 
-    Retorna dicts com os campos da tarefa, `data_registro_origem` (dia do relato ou da
-    criação), `data_execucao` (só concluídas), `registro` (dict ou None) e `fotos` (lista),
-    do dia mais recente para o mais antigo.
+    Args:
+        obra_id: Obra consultada.
+        termo_busca: Cada palavra precisa aparecer na tarefa, no relato/resumo/detalhes/atraso
+            do dia ou no título/descrição de alguma foto do dossiê (sem acentos e sem
+            diferenciar maiúsculas).
+        ambiente_filtro: "Todos", um ambiente ou uma lista de ambientes.
+        status_filtro: "Todos"/"Todas", "Pendentes" ou "Concluídas".
+        data_inicio: Data ISO mínima do dia da tarefa (inclusiva) ou None.
+        data_fim: Data ISO máxima do dia da tarefa (inclusiva) ou None.
+        apenas_atraso: Só tarefas cujo dia tem justificativa de atraso.
+        texto_sem_atraso: Texto padrão que significa "sem atraso".
+        priorizar_diretos: Se alguma tarefa bate pelo próprio texto/fotos, descarta as que só
+            batem pelo relato do dia.
+
+    Returns:
+        Lista de dicts com os campos da tarefa, `data_registro_origem`, `data_execucao` (só
+        concluídas), `registro` (dict ou None) e `fotos` (lista), do dia mais recente para o
+        mais antigo.
+
+    Note:
+        Segurança: todos os filtros vão como parâmetros SQL (`?`), e o LIKE escapa os curingas.
     """
     status = "Todas" if status_filtro in (None, "", "Todos") else status_filtro
     if status not in STATUS_TAREFA:
@@ -1254,11 +1419,30 @@ def inserir_midia_obra(
     foto_bytes_original: Optional[int] = None,
     vinculo_ia: bool = False,
 ) -> int:
-    """Vincula uma foto (já salva em uploads\\) à obra, a um ambiente e, opcionalmente, a um
-    registro diário e/ou tarefa. Retorna o id da mídia.
+    """Registra uma foto já salva em uploads e a liga à obra, ao ambiente e à tarefa.
 
-    `vinculo_ia=True`: o vínculo (ou a ausência de tarefa) foi decidido pela análise visual da
-    IA, e a foto solta não é religada automaticamente por ambiente depois."""
+    O registro diário e a tarefa são opcionais. Uma mesma foto ligada a várias tarefas é gravada como várias linhas com o mesmo
+    `caminho_foto`; o ZIP e a exclusão tratam o arquivo como único.
+
+    Args:
+        obra_id: Obra dona da foto.
+        caminho_foto: Caminho devolvido por `validate_and_save_media`.
+        ambiente: Cômodo (normalizado; vazio vira "Geral").
+        titulo_servico: Serviço mostrado na foto.
+        descricao_tecnica: Descrição As-Built (tubulações, conduítes, medidas...).
+        registro_id: Registro diário de origem, se houver.
+        tarefa_id: Tarefa documentada pela foto, se houver.
+        data_midia: Data ISO da foto (padrão: hoje).
+        foto_bytes_original: Tamanho do arquivo como saiu do celular, para mostrar a economia.
+        vinculo_ia: True quando o vínculo (ou a ausência de tarefa) foi decidido pela análise
+            visual da IA; a foto solta então não é religada por ambiente depois.
+
+    Returns:
+        Id da nova linha em `midias_obra`.
+
+    Raises:
+        CaminhoInseguroError: `caminho_foto` fora da pasta uploads.
+    """
     if caminho_midia_seguro(caminho_foto) is None:
         raise CaminhoInseguroError(f"Caminho de foto fora da pasta uploads: {caminho_foto}")
     with get_connection() as conn:
@@ -1279,9 +1463,17 @@ def inserir_midia_obra(
 
 
 def listar_midias_obra(obra_id: int, registro_id: Optional[int] = None, tarefa_id: Optional[int] = None) -> list[dict]:
-    """Fotos da obra (opcionalmente só de um registro ou tarefa), por ambiente e data.
+    """Lista as fotos da obra com os dados da tarefa e do registro vinculados.
 
-    Inclui dados da tarefa e do registro vinculados, para busca e exibição.
+    Args:
+        obra_id: Obra consultada.
+        registro_id: Se informado, só as fotos desse registro.
+        tarefa_id: Se informado, só as fotos vinculadas a essa tarefa.
+
+    Returns:
+        Dicts das linhas de `midias_obra` com `tarefa_descricao`, `tarefa_concluida` e os
+        textos do registro, ordenados por ambiente, data (mais recente primeiro) e id. Uma foto
+        compartilhada por várias tarefas aparece uma vez por tarefa.
     """
     where, params = ["m.obra_id = ?"], [obra_id]
     if registro_id is not None:
@@ -1319,10 +1511,16 @@ def editar_midia_obra(midia_id: int, ambiente: str, titulo_servico: str, descric
 
 
 def excluir_midia_obra(midia_id: int) -> bool:
-    """Exclui a foto da galeria e apaga o arquivo de uploads\\ se nada mais o usar.
+    """Exclui uma foto da galeria e apaga o arquivo se nada mais o usar.
 
-    Para fotos migradas de registros antigos, também desvincula a foto do registro
-    (senão a migração a recolocaria na galeria no próximo início).
+    Para fotos migradas de registros antigos, também desvincula a foto do registro; senão a
+    migração a recolocaria na galeria no próximo início.
+
+    Args:
+        midia_id: Id em `midias_obra`.
+
+    Returns:
+        True se a foto existia e foi excluída; False caso contrário.
     """
     with get_connection() as conn:
         row = conn.execute("SELECT caminho_foto FROM midias_obra WHERE id = ?", (midia_id,)).fetchone()
